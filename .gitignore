@@ -7,3 +7,5 @@
 
 # The state directory, if it is kept next to the project.
 /state/
+
+.idea

@@ -1,0 +1,14 @@
+{{define "content"}}
+<form method="post" action="/login">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <label>
+    Пользователь
+    <input type="text" name="user" required autofocus>
+  </label>
+  <label>
+    Пароль
+    <input type="password" name="password" required>
+  </label>
+  <button type="submit">Войти</button>
+</form>
+{{end}}

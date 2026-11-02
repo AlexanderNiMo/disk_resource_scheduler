@@ -1,0 +1,9 @@
+# The build artefacts.
+/bin/
+
+# The configuration file holds the password of the web user: it is copied
+# from config.yaml.example and never committed.
+/config.yaml
+
+# The state directory, if it is kept next to the project.
+/state/

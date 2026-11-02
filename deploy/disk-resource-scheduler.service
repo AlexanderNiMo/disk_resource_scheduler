@@ -1,0 +1,47 @@
+[Unit]
+Description=Планировщик свободного места на дисках (disk_resource_scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=diskd
+Group=diskd
+ExecStart=/usr/local/bin/diskd --config /etc/disk-resource-scheduler/config.yaml
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=120s
+
+# systemd creates the two directories with the right owner and rights.
+ConfigurationDirectory=disk-resource-scheduler
+ConfigurationDirectoryMode=0750
+StateDirectory=disk-resource-scheduler
+StateDirectoryMode=0750
+
+# The daemon moves files between the media volumes and writes nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The volumes the daemon may write to. The "-" prefix means "do not fail if
+# the path is missing": a disk that is not mounted at boot must not stop the
+# service from starting. Keep this list in sync with the folders in the
+# config.
+ReadWritePaths=-/media -/media5 -/media6 -/media7 -/media8
+
+[Install]
+WantedBy=multi-user.target

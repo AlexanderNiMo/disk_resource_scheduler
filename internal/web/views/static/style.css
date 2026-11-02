@@ -1,0 +1,50 @@
+/* The page is one column of tables; pico does the rest. */
+
+main.container {
+  max-width: 70rem;
+}
+
+header.top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+header.top form {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+h2 {
+  margin-top: 2rem;
+}
+
+table {
+  width: 100%;
+}
+
+code {
+  font-size: 0.85em;
+  word-break: break-all;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.actions form {
+  margin: 0;
+}
+
+td form {
+  margin: 0;
+}
+
+small {
+  color: var(--pico-muted-color);
+}

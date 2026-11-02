@@ -1,0 +1,76 @@
+# The configuration of the disk scheduler.
+#
+# The path is the key of the map: every folder is a mount point of a disk.
+#   dir_type: src — files leave this folder;
+#   dir_type: dst — files come to this folder.
+#   type — a tag. An entry only ever goes to a folder with the same tag.
+#   min_free — for a src folder the threshold below which files are moved
+#              away; for a dst folder the free space that is not touched.
+
+log:
+  level: info
+  format: text
+
+server:
+  listen: "0.0.0.0:8088"
+  # Only used to decide whether the cookies get the Secure flag.
+  base_url: "http://disk.lan:8088"
+
+# When the folders are looked at. An ordinary cron expression.
+scan:
+  schedule: "*/30 * * * *"
+  # An entry is not moved if it was changed less than this ago.
+  min_age: "24h"
+
+# Where the plan and the history are kept.
+state:
+  dir: "/var/lib/disk-resource-scheduler"
+
+# The users of the web interface. The password is stored as it is: the file
+# has to be readable by the daemon user only (0600, root:diskd).
+web:
+  users:
+    alex: "change-me"
+
+folders:
+  /media8/serials:
+    dir_type: src
+    type: 2
+    min_free: 50GB
+  /media8/films:
+    dir_type: src
+    type: 1
+    min_free: 50GB
+
+  /media/serials:
+    dir_type: dst
+    type: 2
+    min_free: 50GB
+  /media/films:
+    dir_type: dst
+    type: 1
+    min_free: 50GB
+  /media5/serials:
+    dir_type: dst
+    type: 2
+    min_free: 50GB
+  /media5/films:
+    dir_type: dst
+    type: 1
+    min_free: 50GB
+  /media6/serials:
+    dir_type: dst
+    type: 2
+    min_free: 50GB
+  /media6/films:
+    dir_type: dst
+    type: 1
+    min_free: 50GB
+  /media7/serials:
+    dir_type: dst
+    type: 2
+    min_free: 50GB
+  /media7/films:
+    dir_type: dst
+    type: 1
+    min_free: 50GB

@@ -1,0 +1,109 @@
+{{define "plan_block"}}
+<section>
+  <h2>План перемещения</h2>
+
+  {{if .Plan.HasPlan}}
+    <p>План #{{.Plan.PlanID}} — {{.Plan.StateText}}</p>
+
+    <div class="actions">
+      <form method="post" action="/plan/approve">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="plan_id" value="{{.Plan.PlanID}}">
+        <button type="submit" {{if not .Plan.CanApprove}}disabled{{end}}>Одобрить</button>
+      </form>
+      <form method="post" action="/plan/reject">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="plan_id" value="{{.Plan.PlanID}}">
+        <button type="submit" class="secondary" {{if not .Plan.CanReject}}disabled{{end}}>Отклонить</button>
+      </form>
+      <form method="post" action="/plan/rollback">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <input type="hidden" name="plan_id" value="{{.Plan.PlanID}}">
+        <input type="hidden" name="move_id" value="0">
+        <button type="submit" class="secondary" {{if not .Plan.CanRollback}}disabled{{end}}>Откатить все</button>
+      </form>
+    </div>
+
+    <table>
+      <thead>
+        <tr><th>Что</th><th>Размер</th><th>Откуда</th><th>Куда</th><th>Состояние</th><th></th></tr>
+      </thead>
+      <tbody>
+      {{range .Plan.Rows}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td>{{.Size}}</td>
+          <td><code>{{.Src}}</code></td>
+          <td><code>{{.Dst}}</code></td>
+          <td>
+            {{.Status}}{{if .Attempt}} (попытка {{.Attempt}}){{end}}
+            {{if .Error}}<br><small>{{.Error}}</small>{{end}}
+          </td>
+          <td>
+            {{if .CanRollback}}
+            <form method="post" action="/plan/rollback">
+              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+              <input type="hidden" name="plan_id" value="{{$.Plan.PlanID}}">
+              <input type="hidden" name="move_id" value="{{.ID}}">
+              <button type="submit" class="secondary">Откатить</button>
+            </form>
+            {{end}}
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+
+    {{if .Plan.Unmovable}}
+    <h3>Не переносится</h3>
+    <table>
+      <thead>
+        <tr><th>Что</th><th>Размер</th><th>Откуда</th><th>Причина</th></tr>
+      </thead>
+      <tbody>
+      {{range .Plan.Unmovable}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td>{{.Size}}</td>
+          <td><code>{{.Src}}</code></td>
+          <td>{{.Reason}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{end}}
+
+  {{else}}
+    <p>{{.Plan.StateText}}</p>
+  {{end}}
+</section>
+{{end}}
+
+{{define "history_block"}}
+<table>
+  <thead>
+    <tr><th>План</th><th>Когда</th><th>Переносов</th><th>Размер</th><th>Состояние</th><th></th></tr>
+  </thead>
+  <tbody>
+  {{range .History}}
+    <tr>
+      <td>#{{.ID}} {{.Kind}}</td>
+      <td>{{.CreatedAt}}</td>
+      <td>{{.MovesCount}}</td>
+      <td>{{.Bytes}}</td>
+      <td>{{.State}}</td>
+      <td>
+        {{if .CanRollback}}
+        <form method="post" action="/plan/rollback">
+          <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+          <input type="hidden" name="plan_id" value="{{.ID}}">
+          <input type="hidden" name="move_id" value="0">
+          <button type="submit" class="secondary">Откатить</button>
+        </form>
+        {{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

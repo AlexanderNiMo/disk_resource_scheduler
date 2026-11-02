@@ -1,0 +1,37 @@
+{{define "content"}}
+<section>
+  <h2>Папки</h2>
+  <table>
+    <thead>
+      <tr><th>Папка</th><th>Роль</th><th>Тип</th><th>Свободно</th><th>Всего</th><th>Порог</th><th>Состояние</th></tr>
+    </thead>
+    <tbody>
+    {{range .Folders}}
+      <tr>
+        <td><code>{{.Path}}</code></td>
+        <td>{{.Role}}</td>
+        <td>{{.Type}}</td>
+        <td>{{.Free}}</td>
+        <td>{{.Total}}</td>
+        <td>{{.MinFree}}</td>
+        <td>{{.State}}{{if .Error}}<br><small>{{.Error}}</small>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+
+  <form method="post" action="/scan">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <button type="submit" class="secondary">Сканировать</button>
+  </form>
+</section>
+
+<div hx-get="/fragments/plan" hx-trigger="every 3s" hx-swap="innerHTML">
+  {{template "plan_block" .}}
+</div>
+
+<section>
+  <h2>История</h2>
+  {{template "history_block" .}}
+</section>
+{{end}}

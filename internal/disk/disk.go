@@ -82,6 +82,11 @@ func ListEntries(dir string, progress EntryProgress) ([]Entry, error) {
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
+		if strings.HasSuffix(name, PartialSuffix) {
+			// The leftover of a copy that was cut in the middle. It is
+			// ours, it is not media, and it must not be moved around.
+			continue
+		}
 		path := filepath.Join(dir, name)
 		info, err := os.Lstat(path)
 		if err != nil {

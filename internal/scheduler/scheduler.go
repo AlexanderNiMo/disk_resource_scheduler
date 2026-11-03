@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,6 +140,10 @@ type Scheduler struct {
 	// dirty counts the changes of the moves that are not in the state file
 	// yet.
 	dirty int
+	// epoch counts the changes that make a measurement stale: an approval,
+	// a rejection, a rollback. A scan that started before such a change
+	// throws its result away.
+	epoch uint64
 	// scan is what the scan is doing right now.
 	scan ScanStatus
 
@@ -167,6 +173,11 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	s.ctx, s.cancel = base, cancel
 	s.mu.Unlock()
 
+	// The leftovers of the copies that were cut in the middle are thrown
+	// away first: they are the daemon's own files, they are in the way and
+	// nothing else would free the space they take.
+	s.cleanPartials(s.cfg.Load())
+
 	st, plan, err := s.store.Load()
 	if err != nil {
 		s.log.Warn("could not read the state file, starting empty", "error", err)
@@ -189,6 +200,32 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	// itself while a plan waits for an approval.
 	s.run(func() { s.Scan(base) })
 	return nil
+}
+
+// cleanPartials removes the leftovers of the copies that were cut in the
+// middle.
+//
+// A copy that was cut off leaves a file with the daemon's own suffix behind.
+// Nothing else would ever take it away, and it takes the space of a whole
+// film. The plan that was interrupted copies the entry again from the source,
+// so throwing the leftover away is safe.
+func (s *Scheduler) cleanPartials(cfg *config.Config) {
+	for _, folder := range cfg.Sorted() {
+		entries, err := os.ReadDir(folder.Path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), disk.PartialSuffix) {
+				continue
+			}
+			path := filepath.Join(folder.Path, entry.Name())
+			s.log.Info("removing the leftover of a copy", "path", path)
+			if err := os.RemoveAll(path); err != nil {
+				s.log.Warn("could not remove the leftover", "path", path, "error", err)
+			}
+		}
+	}
 }
 
 // Stop cancels a running execution and waits for it.
@@ -229,7 +266,13 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	cfg := s.cfg.Load()
 	started := time.Now()
 	s.mu.Lock()
-	s.scan = ScanStatus{Running: true, Started: started, Total: len(cfg.Folders)}
+	s.scan.Running = true
+	s.scan.Started = started
+	s.scan.Total = len(cfg.Folders)
+	s.scan.Folder = ""
+	s.scan.Entries = 0
+	s.scan.Measured = 0
+	epoch := s.epoch
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -243,6 +286,13 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	measured := s.gather(ctx, cfg)
 
 	s.mu.Lock()
+	if s.epoch != epoch {
+		// The disks changed while the scan was running: the measurement is
+		// stale and the plan it would make is wrong. Throw it away.
+		s.mu.Unlock()
+		s.log.Info("the scan is stale, the plan changed while it was running")
+		return nil
+	}
 	s.next++
 	plan := buildPlan(cfg, measured, time.Now(), s.next)
 	s.plan = plan
@@ -299,6 +349,7 @@ func (s *Scheduler) Approve(planID int) error {
 	}
 	plan := s.plan
 	s.st = StateRunning
+	s.epoch++
 	s.mu.Unlock()
 
 	s.save()
@@ -324,6 +375,7 @@ func (s *Scheduler) Reject(planID int) error {
 	plan := s.plan
 	s.plan = nil
 	s.st = StateIdle
+	s.epoch++
 	s.mu.Unlock()
 
 	s.appendHistory(plan, "plan", StateIdle, time.Now())
@@ -378,6 +430,7 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 	isCurrent := current != nil && current.ID == planID
 	s.mu.Lock()
 	s.st = StateRollingBack
+	s.epoch++
 	s.mu.Unlock()
 
 	s.save()
@@ -514,8 +567,14 @@ func (s *Scheduler) ScanStatus() ScanStatus {
 func (s *Scheduler) execute(plan *Plan, resume bool) {
 	for i := range plan.Moves {
 		if s.stopped() {
+			// The state stays "running": the next start picks the plan up
+			// again. Calling it done would drop the rest of the plan.
 			s.log.Warn("the execution was stopped, the rest of the plan stays pending")
-			break
+			s.mu.Lock()
+			s.st = StateRunning
+			s.mu.Unlock()
+			s.save()
+			return
 		}
 		s.mu.RLock()
 		move := plan.Moves[i]
@@ -555,7 +614,11 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 	for _, i := range targets {
 		if s.stopped() {
 			s.log.Warn("the rollback was stopped, the rest stays as it is")
-			break
+			s.mu.Lock()
+			s.st = StateRollingBack
+			s.mu.Unlock()
+			s.save()
+			return
 		}
 		s.mu.RLock()
 		move := plan.Moves[i]

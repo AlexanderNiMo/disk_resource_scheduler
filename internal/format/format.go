@@ -2,10 +2,7 @@
 // person.
 package format
 
-import (
-	"fmt"
-	"time"
-)
+import "fmt"
 
 // Bytes renders a file size the way a person reads it.
 //
@@ -25,22 +22,4 @@ func Bytes(n int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f ПиБ", value)
-}
-
-// Duration renders a span the way a person reads it: "24 ч", "1 ч 30 мин".
-func Duration(d time.Duration) string {
-	switch {
-	case d >= 24*time.Hour:
-		days := int(d / (24 * time.Hour))
-		if days%24 == 0 {
-			return fmt.Sprintf("%d сут", days/24)
-		}
-		return fmt.Sprintf("%d ч", int(d/time.Hour))
-	case d >= time.Hour:
-		return fmt.Sprintf("%d ч", int(d/time.Hour))
-	case d >= time.Minute:
-		return fmt.Sprintf("%d мин", int(d/time.Minute))
-	default:
-		return fmt.Sprintf("%d с", int(d/time.Second))
-	}
 }

@@ -113,7 +113,7 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 		result.Plan.CanReject = state == scheduler.StatePending
 		result.Plan.CanRollback = state == scheduler.StateDone || state == scheduler.StateFailed
 		if len(plan.Moves) == 0 {
-			result.Plan.StateText = "переносить нечего: на всех источниках достаточно свободного места"
+			result.Plan.StateText = "переносить нечего"
 		}
 
 		for _, folder := range plan.Folders {

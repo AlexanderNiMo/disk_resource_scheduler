@@ -412,3 +412,40 @@ func TestASessionEndsWithItsTime(t *testing.T) {
 		t.Fatalf("the dashboard returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
 	}
 }
+
+func TestAChangedPasswordEndsTheSession(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	sch := scheduler.New(store, logger, schedulerProbe{}, scheduler.NewStateStore(t.TempDir()), history)
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	client := login(t, httpServer)
+
+	// The password is changed: the session that was made with the old one
+	// must stop working.
+	store.Store(&config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "another"}},
+	})
+
+	resp, err := client.Get(httpServer.URL + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("the dashboard returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"time"
@@ -66,13 +67,14 @@ func (s *Server) sessions(next http.Handler) http.Handler {
 		}
 
 		if cookie, err := r.Cookie(sessionCookie); err == nil && cookie.Value != "" {
-			user, ok := s.sessionUser(cookie.Value)
+			found, ok := s.sessionUser(cookie.Value)
 			switch {
-			case ok && s.userKnown(user):
-				ctx = context.WithValue(ctx, ctxUser, user)
+			case ok && s.sessionValid(found):
+				ctx = context.WithValue(ctx, ctxUser, found.user)
 			case ok:
-				// The user was taken out of the config: the config is the
-				// list of the people who may approve the moves.
+				// The user was taken out of the config, or the password was
+				// changed: the config is the list of the people who may
+				// approve the moves.
 				s.dropSession(cookie.Value)
 				s.clearCookie(w, sessionCookie)
 			default:
@@ -135,26 +137,30 @@ func (s *Server) csrfOK(r *http.Request) bool {
 func (s *Server) newSession(user string) string {
 	token := randomToken()
 	s.mu.Lock()
-	s.tokens[token] = session{user: user, expires: time.Now().Add(sessionTTL)}
+	s.tokens[token] = session{
+		user:    user,
+		hash:    passwordHash(s.cfg.Load().Web.Users[user]),
+		expires: time.Now().Add(sessionTTL),
+	}
 	s.mu.Unlock()
 	return token
 }
 
-func (s *Server) sessionUser(token string) (string, bool) {
+func (s *Server) sessionUser(token string) (session, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	found, ok := s.tokens[token]
 	if !ok {
-		return "", false
+		return session{}, false
 	}
 	if time.Now().After(found.expires) {
 		delete(s.tokens, token)
-		return "", false
+		return session{}, false
 	}
 	found.expires = time.Now().Add(sessionTTL)
 	s.tokens[token] = found
-	return found.user, true
+	return found, true
 }
 
 func (s *Server) dropSession(token string) {
@@ -180,13 +186,24 @@ func (s *Server) checkCredentials(name, password string) bool {
 	return known && subtle.ConstantTimeCompare(got[:], expected[:]) == 1
 }
 
-// userKnown tells whether the user is still in the configuration.
+// sessionValid tells whether the session may still be used.
 //
-// A user that was taken out of the config must stop working at once: the
-// config is the list of the people who may approve the moves.
-func (s *Server) userKnown(name string) bool {
-	_, ok := s.cfg.Load().Web.Users[name]
-	return ok
+// The user has to be in the configuration and the password has to be the one
+// the session was made with: a user that was taken out of the config, or a
+// password that was changed, must stop working at once. The config is the
+// list of the people who may approve the moves.
+func (s *Server) sessionValid(found session) bool {
+	password, ok := s.cfg.Load().Web.Users[found.user]
+	if !ok {
+		return false
+	}
+	return found.hash == passwordHash(password)
+}
+
+// passwordHash is what a session remembers about the password.
+func passwordHash(password string) string {
+	sum := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(sum[:])
 }
 
 // secureCookies tells the browser to keep the cookies to itself over https.

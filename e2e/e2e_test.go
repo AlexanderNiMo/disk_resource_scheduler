@@ -344,3 +344,87 @@ func moved(t *testing.T, dir, name string) bool {
 	_, err := os.Stat(filepath.Join(dir, name))
 	return err == nil
 }
+
+// The daemon lives longer than the context it was started with. The start
+// context of main.go used to carry a timeout, and the executions stopped
+// half an hour later: the plan showed "done" and nothing had been moved.
+func TestTheDaemonLivesLongerThanTheContextItWasStartedWith(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "media8", "serials")
+	dst := filepath.Join(root, "media5", "serials")
+	writeFile(t, filepath.Join(src, "Show.S01", "ep01.mkv"), "first episode")
+	mkdirAll(t, dst)
+
+	configPath := filepath.Join(root, "config.yaml")
+	writeFile(t, configPath, fmt.Sprintf(`
+log:
+  level: error
+server:
+  listen: "127.0.0.1:0"
+scan:
+  schedule: "@every 1h"
+  min_age: "0s"
+state:
+  dir: %q
+web:
+  users:
+    alice: "secret"
+folders:
+  %s:
+    dir_type: src
+    type: 2
+    min_free: 900TB
+  %s:
+    dir_type: dst
+    type: 2
+`, filepath.Join(root, "state"), src, dst))
+
+	devs := map[string]uint64{src: 1, dst: 2}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	daemon, err := app.New(configPath, app.WithProbe(splitProbe{real: disk.StatfsProbe{}, devs: devs}))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := daemon.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer daemon.Stop(context.Background())
+
+	client := &api{base: daemon.Addr()}
+	client.login(t, "alice", "secret")
+
+	var plan planResponse
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		plan = client.plan(t)
+		if plan.Plan != nil && len(plan.Plan.Moves) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if plan.Plan == nil || len(plan.Plan.Moves) != 1 {
+		t.Fatalf("the plan is %+v, want the one entry of the library", plan.Plan)
+	}
+
+	// The context the daemon was started with is over by now.
+	time.Sleep(500 * time.Millisecond)
+
+	client.post(t, "/api/plan/approve", url.Values{"plan_id": {strconv.Itoa(plan.Plan.ID)}})
+
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		plan = client.plan(t)
+		if plan.Plan != nil && plan.Plan.Moves[0].Status == "done" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if plan.Plan == nil || plan.Plan.Moves[0].Status != "done" {
+		t.Fatalf("the move is %+v, want it done", plan.Plan)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "Show.S01", "ep01.mkv")); err != nil {
+		t.Fatalf("the file did not move: %v", err)
+	}
+}

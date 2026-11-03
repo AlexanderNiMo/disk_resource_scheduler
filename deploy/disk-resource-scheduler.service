@@ -3,6 +3,11 @@ Description=Планировщик свободного места на диск
 After=network-online.target
 Wants=network-online.target
 
+# A config that does not parse must not turn into an endless restart loop:
+# five tries in five minutes, then systemd leaves the service alone.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=diskd

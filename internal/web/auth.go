@@ -66,9 +66,16 @@ func (s *Server) sessions(next http.Handler) http.Handler {
 		}
 
 		if cookie, err := r.Cookie(sessionCookie); err == nil && cookie.Value != "" {
-			if user, ok := s.sessionUser(cookie.Value); ok {
+			user, ok := s.sessionUser(cookie.Value)
+			switch {
+			case ok && s.userKnown(user):
 				ctx = context.WithValue(ctx, ctxUser, user)
-			} else {
+			case ok:
+				// The user was taken out of the config: the config is the
+				// list of the people who may approve the moves.
+				s.dropSession(cookie.Value)
+				s.clearCookie(w, sessionCookie)
+			default:
 				// Expired or revoked: clearing it stops the browser sending
 				// a dead token on every request.
 				s.clearCookie(w, sessionCookie)
@@ -78,10 +85,15 @@ func (s *Server) sessions(next http.Handler) http.Handler {
 	})
 }
 
-// requireAuth redirects to the login page when there is no session.
+// requireAuth turns away a request without a session: a redirect to the
+// login page for a page, an answer for the API.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := r.Context().Value(ctxUser).(string); !ok {
+			if isAPI(r) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "no session"})
+				return
+			}
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
@@ -166,6 +178,15 @@ func (s *Server) checkCredentials(name, password string) bool {
 	got := sha256.Sum256([]byte(password))
 	expected := sha256.Sum256([]byte(want))
 	return known && subtle.ConstantTimeCompare(got[:], expected[:]) == 1
+}
+
+// userKnown tells whether the user is still in the configuration.
+//
+// A user that was taken out of the config must stop working at once: the
+// config is the list of the people who may approve the moves.
+func (s *Server) userKnown(name string) bool {
+	_, ok := s.cfg.Load().Web.Users[name]
+	return ok
 }
 
 // secureCookies tells the browser to keep the cookies to itself over https.

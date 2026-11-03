@@ -13,6 +13,13 @@ import (
 // Progress is called with the number of bytes copied so far.
 type Progress func(copied int64)
 
+// partialSuffix is the name the copy gets before it is put in place.
+//
+// The copy never writes into the destination itself: a destination that is
+// somebody else's stays untouched, and a copy that was cut in the middle is
+// picked up by the next attempt under a name the daemon owns.
+const partialSuffix = ".drs-partial"
+
 // Move moves the entry at src to dst.
 //
 // The same filesystem is a rename; a different one is a copy followed by the
@@ -26,6 +33,10 @@ func Move(src, dst string, progress Progress) error {
 		return fmt.Errorf("move %q: %w", dst, err)
 	}
 
+	// A copy that was cut in the middle is under this name. It is ours, and
+	// it is in the way.
+	os.RemoveAll(dst + partialSuffix)
+
 	err := os.Rename(src, dst)
 	if err == nil {
 		return nil
@@ -34,10 +45,21 @@ func Move(src, dst string, progress Progress) error {
 		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
 
-	if err := CopyTree(src, dst, progress); err != nil {
-		// The partial destination would be picked up as a finished file later.
-		os.RemoveAll(dst)
+	// The copy goes to a name of its own and is put in place at the end, so
+	// that nothing of somebody else is ever written into or deleted.
+	partial := dst + partialSuffix
+	if err := CopyTree(src, partial, progress); err != nil {
+		os.RemoveAll(partial)
 		return err
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		// Somebody put a file there while the copy was running.
+		os.RemoveAll(partial)
+		return fmt.Errorf("move %q: %w", dst, os.ErrExist)
+	}
+	if err := os.Rename(partial, dst); err != nil {
+		os.RemoveAll(partial)
+		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
 	if err := os.RemoveAll(src); err != nil {
 		return fmt.Errorf("remove the source %q: %w", src, err)
@@ -81,7 +103,9 @@ func (c *copier) copy(src, dst string) error {
 		return os.Symlink(target, dst)
 
 	case info.IsDir():
-		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+		// Mkdir, not MkdirAll: a directory that is already there means the
+		// copy would mix our files with somebody else's.
+		if err := os.Mkdir(dst, info.Mode().Perm()); err != nil {
 			return err
 		}
 		items, err := os.ReadDir(src)
@@ -111,7 +135,9 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	// O_EXCL: the file must not be there yet, or the copy would overwrite
+	// what is already there.
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
 	if err != nil {
 		return err
 	}

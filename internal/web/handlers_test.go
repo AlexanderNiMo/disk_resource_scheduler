@@ -7,8 +7,12 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
 	"github.com/alex/disk_resource_scheduler/internal/disk"
@@ -16,6 +20,14 @@ import (
 )
 
 func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server, _, _ := newTestServerWith(t)
+	return server
+}
+
+// newTestServerWith builds the interface and hands back the server and the
+// scheduler, so that a test can look at what they did.
+func newTestServerWith(t *testing.T) (*httptest.Server, *Server, *scheduler.Scheduler) {
 	t.Helper()
 
 	cfg := &config.Config{
@@ -37,7 +49,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	}
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(httpServer.Close)
-	return httpServer
+	return httpServer, server, sch
 }
 
 // schedulerProbe is a probe that knows nothing; the tests do not scan.
@@ -198,8 +210,10 @@ func TestTheApiNeedsASession(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("the api returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
+	// The API answers with a status, not with a page: a script that follows
+	// the redirect would get the login page instead of an answer.
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the api returned %d, want %d", resp.StatusCode, http.StatusUnauthorized)
 	}
 }
 
@@ -274,5 +288,127 @@ func TestApprovingBeforeTheFirstScanIsRefused(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "not been scanned") {
 		t.Fatalf("the answer is %s, want it to say that nothing was scanned", body)
+	}
+}
+
+func TestTheManualScanMeasuresEveryFolder(t *testing.T) {
+	root := t.TempDir()
+	folders := map[string]config.Folder{}
+	for i := 0; i < 5; i++ {
+		dir := filepath.Join(root, "src"+strconv.Itoa(i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "movie.mkv"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		folders[dir] = config.Folder{Path: dir, DirType: config.DirTypeSrc, Type: 2, MinFree: 1}
+	}
+
+	cfg := &config.Config{
+		Server:  config.Server{Listen: "127.0.0.1:0"},
+		Web:     config.Web{Users: map[string]string{"alex": "secret"}},
+		Folders: folders,
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	sch := scheduler.New(store, logger, disk.StatfsProbe{}, scheduler.NewStateStore(t.TempDir()), history)
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	client := login(t, httpServer)
+	page, _ := url.Parse(httpServer.URL)
+	token := ""
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			token = cookie.Value
+		}
+	}
+
+	resp, err := client.PostForm(httpServer.URL+"/scan", url.Values{"csrf_token": {token}})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	// The scan runs after the response: the context of the request is gone
+	// by then, and a scan that used it would stop at the first folder.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status := sch.ScanStatus()
+		if status.Scanned && !status.Running {
+			if status.Measured != status.Total {
+				t.Fatalf("the scan measured %d of %d folders", status.Measured, status.Total)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the scan never finished")
+}
+
+func TestASessionOfARemovedUserStopsWorking(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	sch := scheduler.New(store, logger, schedulerProbe{}, scheduler.NewStateStore(t.TempDir()), history)
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	client := login(t, httpServer)
+
+	// The user is taken out of the config: the config is the list of the
+	// people who may approve the moves.
+	store.Store(&config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"bob": "other"}},
+	})
+
+	resp, err := client.Get(httpServer.URL + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("the dashboard returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
+	}
+}
+
+func TestASessionEndsWithItsTime(t *testing.T) {
+	server, srv, _ := newTestServerWith(t)
+	client := login(t, server)
+
+	// Reach into the store and make the session older than it may be.
+	srv.mu.Lock()
+	for token, found := range srv.tokens {
+		found.expires = time.Now().Add(-time.Minute)
+		srv.tokens[token] = found
+	}
+	srv.mu.Unlock()
+
+	resp, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("the dashboard returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
 	}
 }

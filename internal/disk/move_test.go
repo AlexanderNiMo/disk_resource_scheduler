@@ -129,3 +129,22 @@ func TestMoveWithinOneFilesystem(t *testing.T) {
 		t.Fatalf("a rename reported %d bytes copied", copied)
 	}
 }
+
+func TestCopyTreeRefusesAnExistingDestination(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "movie.mkv"), "abc")
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dst, "somebody-elses.mkv"), "not ours")
+
+	if err := CopyTree(src, dst, nil); err == nil {
+		t.Fatal("want an error when the destination is already there")
+	}
+	body, err := os.ReadFile(filepath.Join(dst, "somebody-elses.mkv"))
+	if err != nil || string(body) != "not ours" {
+		t.Fatalf("the file in the destination was touched: %q %v", body, err)
+	}
+}

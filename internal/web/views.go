@@ -97,7 +97,7 @@ type historyRow struct {
 // The view models are separate from the scheduler's types on purpose: adding
 // a field to a plan does not change any page until it is added here on
 // purpose.
-func (s *Server) buildView(r *http.Request) view {
+func (s *Server) buildView(r *http.Request, withHistory bool) view {
 	result := view{page: s.buildPage(r)}
 
 	state, plan := s.sch.Snapshot()
@@ -172,6 +172,10 @@ func (s *Server) buildView(r *http.Request) view {
 				State:   "не измерено",
 			})
 		}
+	}
+
+	if !withHistory {
+		return result
 	}
 
 	entries, err := s.history.List()

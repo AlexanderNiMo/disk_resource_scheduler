@@ -64,6 +64,9 @@ func (s *Server) Handler() http.Handler {
 
 		r.Get("/", s.handleDashboard)
 		r.Get("/fragments/plan", s.handlePlanFragment)
+
+		// The same handlers serve the pages and the API: the answer is
+		// JSON for the API and a page otherwise.
 		r.Post("/scan", s.handleScan)
 		r.Post("/plan/approve", s.handleApprove)
 		r.Post("/plan/reject", s.handleReject)
@@ -71,10 +74,10 @@ func (s *Server) Handler() http.Handler {
 
 		r.Get("/api/plan", s.apiPlan)
 		r.Get("/api/history", s.apiHistory)
-		r.Post("/api/scan", s.apiScan)
-		r.Post("/api/plan/approve", s.apiApprove)
-		r.Post("/api/plan/reject", s.apiReject)
-		r.Post("/api/plan/rollback", s.apiRollback)
+		r.Post("/api/scan", s.handleScan)
+		r.Post("/api/plan/approve", s.handleApprove)
+		r.Post("/api/plan/reject", s.handleReject)
+		r.Post("/api/plan/rollback", s.handleRollback)
 	})
 
 	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(s.tmpl.static))))
@@ -84,6 +87,12 @@ func (s *Server) Handler() http.Handler {
 // accessLog writes one line per request.
 func (s *Server) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The page asks for the plan every few seconds. A line per poll
+		// would bury everything else in the log.
+		if r.URL.Path == "/fragments/plan" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		started := time.Now()
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(recorder, r)

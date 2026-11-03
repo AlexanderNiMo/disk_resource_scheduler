@@ -13,12 +13,12 @@ import (
 // Progress is called with the number of bytes copied so far.
 type Progress func(copied int64)
 
-// partialSuffix is the name the copy gets before it is put in place.
+// PartialSuffix is the name the copy gets before it is put in place.
 //
 // The copy never writes into the destination itself: a destination that is
 // somebody else's stays untouched, and a copy that was cut in the middle is
 // picked up by the next attempt under a name the daemon owns.
-const partialSuffix = ".drs-partial"
+const PartialSuffix = ".drs-partial"
 
 // Move moves the entry at src to dst.
 //
@@ -35,7 +35,7 @@ func Move(src, dst string, progress Progress) error {
 
 	// A copy that was cut in the middle is under this name. It is ours, and
 	// it is in the way.
-	os.RemoveAll(dst + partialSuffix)
+	os.RemoveAll(dst + PartialSuffix)
 
 	err := os.Rename(src, dst)
 	if err == nil {
@@ -47,7 +47,7 @@ func Move(src, dst string, progress Progress) error {
 
 	// The copy goes to a name of its own and is put in place at the end, so
 	// that nothing of somebody else is ever written into or deleted.
-	partial := dst + partialSuffix
+	partial := dst + PartialSuffix
 	if err := CopyTree(src, partial, progress); err != nil {
 		os.RemoveAll(partial)
 		return err

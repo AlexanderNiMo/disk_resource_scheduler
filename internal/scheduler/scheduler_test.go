@@ -710,3 +710,40 @@ func TestAScanIsThrownAwayWhenThePlanChangesUnderIt(t *testing.T) {
 		t.Fatalf("the plan is #%d, want the old one #%d", after.ID, plan.ID)
 	}
 }
+
+func TestTheLeftoversOfACopyAreRemovedAtTheStart(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	// The leftover of a copy that was cut in the middle, and a file that
+	// has nothing to do with the daemon.
+	os.WriteFile(filepath.Join(dst, "movie.mkv.drs-partial"), []byte("half"), 0o644)
+	os.WriteFile(filepath.Join(src, "somebody-elses.mkv"), []byte("not ours"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 500 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(t.TempDir()), NewHistory(t.TempDir()))
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+
+	if _, err := os.Stat(filepath.Join(dst, "movie.mkv.drs-partial")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the leftover of the copy is still there: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(src, "somebody-elses.mkv")); err != nil {
+		t.Fatalf("a file that is not the daemon's was removed: %v", err)
+	}
+}

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -171,6 +173,11 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	s.ctx, s.cancel = base, cancel
 	s.mu.Unlock()
 
+	// The leftovers of the copies that were cut in the middle are thrown
+	// away first: they are the daemon's own files, they are in the way and
+	// nothing else would free the space they take.
+	s.cleanPartials(s.cfg.Load())
+
 	st, plan, err := s.store.Load()
 	if err != nil {
 		s.log.Warn("could not read the state file, starting empty", "error", err)
@@ -193,6 +200,32 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	// itself while a plan waits for an approval.
 	s.run(func() { s.Scan(base) })
 	return nil
+}
+
+// cleanPartials removes the leftovers of the copies that were cut in the
+// middle.
+//
+// A copy that was cut off leaves a file with the daemon's own suffix behind.
+// Nothing else would ever take it away, and it takes the space of a whole
+// film. The plan that was interrupted copies the entry again from the source,
+// so throwing the leftover away is safe.
+func (s *Scheduler) cleanPartials(cfg *config.Config) {
+	for _, folder := range cfg.Sorted() {
+		entries, err := os.ReadDir(folder.Path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), disk.PartialSuffix) {
+				continue
+			}
+			path := filepath.Join(folder.Path, entry.Name())
+			s.log.Info("removing the leftover of a copy", "path", path)
+			if err := os.RemoveAll(path); err != nil {
+				s.log.Warn("could not remove the leftover", "path", path, "error", err)
+			}
+		}
+	}
 }
 
 // Stop cancels a running execution and waits for it.

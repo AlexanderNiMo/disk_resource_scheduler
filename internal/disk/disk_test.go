@@ -84,7 +84,7 @@ func TestVolumeOf(t *testing.T) {
 func TestListEntriesSkipsTheLeftoversOfACopy(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "movie.mkv"), "abc")
-	writeFile(t, filepath.Join(dir, "movie.mkv"+partialSuffix), "half a file")
+	writeFile(t, filepath.Join(dir, "movie.mkv"+PartialSuffix), "half a file")
 
 	entries, err := ListEntries(dir, nil)
 	if err != nil {

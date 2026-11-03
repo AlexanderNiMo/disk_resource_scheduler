@@ -72,6 +72,7 @@ type moveRow struct {
 	Attempt     int
 	Error       string
 	CanRollback bool
+	CanRemove   bool
 }
 
 type historyRow struct {
@@ -142,6 +143,10 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 				// nothing else is running.
 				CanRollback: move.Status == scheduler.StatusDone &&
 					(state == scheduler.StateDone || state == scheduler.StateFailed),
+				// Only a move that has not been started can be taken out of
+				// the plan, and only while the plan waits for an approval.
+				CanRemove: move.Status == scheduler.StatusPending &&
+					state == scheduler.StatePending,
 			})
 		}
 	} else {

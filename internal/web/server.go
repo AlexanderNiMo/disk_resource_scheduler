@@ -25,7 +25,10 @@ type Server struct {
 }
 
 type session struct {
-	user    string
+	user string
+	// hash is the hash of the password the session was made with. A
+	// changed password ends the sessions of that user.
+	hash    string
 	expires time.Time
 }
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -628,5 +629,84 @@ func TestAMoveNeverTouchesAFileItDidNotCreate(t *testing.T) {
 	// And the source is still there: a failed move changes nothing.
 	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
 		t.Fatalf("the source is gone: %v", err)
+	}
+}
+
+// slowProbe measures the volumes slowly, so that a test can change the plan
+// while a scan is running.
+type slowProbe struct {
+	mu      sync.Mutex
+	delay   time.Duration
+	volumes map[string]disk.Volume
+}
+
+func (p *slowProbe) setDelay(d time.Duration) {
+	p.mu.Lock()
+	p.delay = d
+	p.mu.Unlock()
+}
+
+func (p *slowProbe) VolumeOf(path string) (disk.Volume, error) {
+	p.mu.Lock()
+	delay := p.delay
+	p.mu.Unlock()
+	time.Sleep(delay)
+
+	volume, ok := p.volumes[path]
+	if !ok {
+		return disk.Volume{}, os.ErrNotExist
+	}
+	return volume, nil
+}
+
+func TestAScanIsThrownAwayWhenThePlanChangesUnderIt(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	probe := &slowProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), NewHistory(dir))
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+
+	waitFor(t, "the first scan", func() bool { return sch.ScanStatus().Scanned })
+	_, plan := sch.Snapshot()
+
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	waitFor(t, "the execution", func() bool {
+		state, _ := sch.Snapshot()
+		return state == StateDone
+	})
+
+	// A slow scan starts, and the plan is approved again while it runs: the
+	// measurement it took is stale.
+	probe.setDelay(200 * time.Millisecond)
+	go sch.Scan(context.Background())
+	time.Sleep(50 * time.Millisecond)
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("the second approve: %v", err)
+	}
+
+	waitFor(t, "the scan to finish", func() bool { return !sch.ScanStatus().Running })
+	_, after := sch.Snapshot()
+	if after.ID != plan.ID {
+		t.Fatalf("the plan is #%d, want the old one #%d", after.ID, plan.ID)
 	}
 }

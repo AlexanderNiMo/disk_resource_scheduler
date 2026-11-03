@@ -91,7 +91,14 @@ func New(cfgPath string, opts ...Option) (*App, error) {
 
 // Start brings the daemon up.
 func (a *App) Start(ctx context.Context) error {
-	if err := a.sched.Start(ctx); err != nil {
+	// The daemon lives until it is stopped, not until the context it was
+	// started with runs out: that context may carry a start timeout, and a
+	// timeout that kills the executions half an hour later would leave the
+	// plan approved and nothing moved.
+	base, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	a.cancel = cancel
+
+	if err := a.sched.Start(base); err != nil {
 		return err
 	}
 
@@ -114,8 +121,6 @@ func (a *App) Start(ctx context.Context) error {
 	if err := a.startCron(a.cfg.Load().Scan.Schedule); err != nil {
 		return err
 	}
-	base, cancel := context.WithCancel(ctx)
-	a.cancel = cancel
 	go a.watchConfig(base)
 
 	a.log.Info("the daemon is up", "listen", listener.Addr().String(), "folders", len(a.cfg.Load().Folders))

@@ -80,3 +80,17 @@ func TestVolumeOf(t *testing.T) {
 		t.Fatalf("the volume has no device: %+v", volume)
 	}
 }
+
+func TestListEntriesSkipsTheLeftoversOfACopy(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "movie.mkv"), "abc")
+	writeFile(t, filepath.Join(dir, "movie.mkv"+partialSuffix), "half a file")
+
+	entries, err := ListEntries(dir, nil)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "movie.mkv" {
+		t.Fatalf("got %+v, want only the file", entries)
+	}
+}

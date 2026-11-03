@@ -4,6 +4,7 @@ package scheduler
 
 import (
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -94,7 +95,7 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 				// There is nowhere for it to go: it stays where it is.
 				continue
 			}
-			if _, err := os.Lstat(dst.Path + "/" + entry.Name); err == nil {
+			if _, err := os.Lstat(filepath.Join(dst.Path, entry.Name)); err == nil {
 				// The destination has a file of that name already.
 				continue
 			}
@@ -105,7 +106,7 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 				Name:    entry.Name,
 				Path:    entry.Path,
 				Dst:     dst.Path,
-				DstPath: dst.Path + "/" + entry.Name,
+				DstPath: filepath.Join(dst.Path, entry.Name),
 				Size:    entry.Size,
 				Type:    folder.Type,
 				Status:  StatusPending,

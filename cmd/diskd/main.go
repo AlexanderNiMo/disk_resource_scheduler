@@ -16,10 +16,11 @@ import (
 	"github.com/alex/disk_resource_scheduler/internal/app"
 )
 
-const (
-	startTimeout = 30 * time.Second
-	stopTimeout  = 2 * time.Minute
-)
+// stopTimeout is how long the daemon may take to finish what it is doing
+// when it is asked to stop. A copy that is cut in the middle leaves the
+// source where it was, but the daemon should not be killed while it is still
+// writing.
+const stopTimeout = 2 * time.Minute
 
 // The build information, filled in by the linker.
 var (
@@ -47,9 +48,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	startCtx, cancelStart := context.WithTimeout(context.Background(), startTimeout)
-	defer cancelStart()
-	if err := daemon.Start(startCtx); err != nil {
+	// The daemon lives until the signal: the context it is started with is
+	// its lifetime, not a start timeout.
+	if err := daemon.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}

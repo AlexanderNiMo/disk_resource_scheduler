@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -271,6 +272,11 @@ func newTestScheduler(t *testing.T, cfg *config.Config, probe disk.Probe) *Sched
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { sch.Stop(context.Background()) })
+	// The daemon scans as soon as it starts; the tests should not race it.
+	waitFor(t, "the first scan to finish", func() bool {
+		status := sch.ScanStatus()
+		return status.Scanned && !status.Running
+	})
 	return sch
 }
 
@@ -285,6 +291,44 @@ func waitFor(t *testing.T, what string, condition func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestAnEmptyPlanIsNotSaved(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStateStore(dir)
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			"/src": folder("/src", config.DirTypeSrc, 2, 50*gb),
+			"/dst": folder("/dst", config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	// The source has enough free space, so there is nothing to move.
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		"/src": {Dev: 1, Free: 500 * gb},
+		"/dst": {Dev: 2, Free: 500 * gb},
+	}}
+
+	sch := New(config.NewStore(cfg), testLogger(), probe, store, NewHistory(dir))
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if _, err := os.Stat(store.Path()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the empty plan was saved: %v", err)
+	}
+	// The plan is still there to be shown in the interface.
+	state, plan := sch.Snapshot()
+	if plan == nil || len(plan.Moves) != 0 {
+		t.Fatalf("the plan is %+v, want an empty one", plan)
+	}
+	if state != StatePending {
+		t.Fatalf("the state is %s, want %s", state, StatePending)
+	}
 }
 
 func TestApproveExecutesTheMoves(t *testing.T) {
@@ -341,8 +385,26 @@ func TestApproveExecutesTheMoves(t *testing.T) {
 
 func TestApproveRefusesAStalePlan(t *testing.T) {
 	sch := newTestScheduler(t, &config.Config{}, fakeProbe{})
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
 	if err := sch.Approve(7); err != ErrStalePlan && err != ErrNoPlan {
 		t.Fatalf("approve returned %v, want a stale plan or no plan", err)
+	}
+}
+
+func TestThereIsNoPlanBeforeTheFirstScan(t *testing.T) {
+	// The scheduler is not started, so no scan has happened yet.
+	sch := New(config.NewStore(&config.Config{}), testLogger(), fakeProbe{},
+		NewStateStore(t.TempDir()), NewHistory(t.TempDir()))
+	if err := sch.Approve(1); err != ErrNotScanned {
+		t.Fatalf("approve returned %v, want %v", err, ErrNotScanned)
+	}
+	if err := sch.Reject(1); err != ErrNotScanned {
+		t.Fatalf("reject returned %v, want %v", err, ErrNotScanned)
+	}
+	if err := sch.Rollback(1, 0); err != ErrNotScanned {
+		t.Fatalf("rollback returned %v, want %v", err, ErrNotScanned)
 	}
 }
 

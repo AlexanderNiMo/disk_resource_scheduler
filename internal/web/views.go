@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/alex/disk_resource_scheduler/internal/format"
 	"github.com/alex/disk_resource_scheduler/internal/scheduler"
 )
 
@@ -26,6 +27,18 @@ type view struct {
 	Folders []folderRow
 	Plan    planView
 	History []historyRow
+	Scan    scanView
+}
+
+// scanView is what the scan is doing right now.
+type scanView struct {
+	Running  bool
+	Scanned  bool
+	Folder   string
+	Entries  int
+	Measured int
+	Total    int
+	Started  string
 }
 
 type folderRow struct {
@@ -90,21 +103,35 @@ func (s *Server) buildView(r *http.Request) view {
 	state, plan := s.sch.Snapshot()
 	result.Plan.StateText = stateText(state)
 
+	scan := s.sch.ScanStatus()
+	result.Scan = scanView{
+		Running:  scan.Running,
+		Scanned:  scan.Scanned,
+		Folder:   scan.Folder,
+		Entries:  scan.Entries,
+		Measured: scan.Measured,
+		Total:    scan.Total,
+		Started:  scan.Started.Format("15:04:05"),
+	}
+
 	if plan != nil {
 		result.Plan.HasPlan = true
 		result.Plan.PlanID = plan.ID
-		result.Plan.CanApprove = state == scheduler.StatePending
+		result.Plan.CanApprove = state == scheduler.StatePending && len(plan.Moves) > 0
 		result.Plan.CanReject = state == scheduler.StatePending
 		result.Plan.CanRollback = state == scheduler.StateDone || state == scheduler.StateFailed
+		if len(plan.Moves) == 0 {
+			result.Plan.StateText = "переносить нечего: на всех источниках достаточно свободного места"
+		}
 
 		for _, folder := range plan.Folders {
 			result.Folders = append(result.Folders, folderRow{
 				Path:    folder.Path,
 				Role:    roleText(folder.DirType),
 				Type:    folder.Type,
-				Free:    humanBytes(folder.Free),
-				Total:   humanBytes(folder.Total),
-				MinFree: humanBytes(folder.MinFree),
+				Free:    format.Bytes(folder.Free),
+				Total:   format.Bytes(folder.Total),
+				MinFree: format.Bytes(folder.MinFree),
 				State:   folderStateText(folder.State),
 				Error:   folder.Error,
 			})
@@ -113,7 +140,7 @@ func (s *Server) buildView(r *http.Request) view {
 			result.Plan.Rows = append(result.Plan.Rows, moveRow{
 				ID:      move.ID,
 				Name:    move.Name,
-				Size:    humanBytes(move.Size),
+				Size:    format.Bytes(move.Size),
 				Src:     move.Src,
 				Dst:     move.Dst,
 				Status:  moveStatusText(move.Status),
@@ -128,18 +155,21 @@ func (s *Server) buildView(r *http.Request) view {
 		for _, entry := range plan.Unmovable {
 			result.Plan.Unmovable = append(result.Plan.Unmovable, unmovableRow{
 				Name:   entry.Name,
-				Size:   humanBytes(entry.Size),
+				Size:   format.Bytes(entry.Size),
 				Src:    entry.Src,
 				Reason: entry.Reason,
 			})
 		}
 	} else {
+		// The folders have not been measured yet, so their free space is
+		// unknown; saying so is better than showing nothing.
 		for _, folder := range s.cfg.Load().Sorted() {
 			result.Folders = append(result.Folders, folderRow{
 				Path:    folder.Path,
 				Role:    roleText(string(folder.DirType)),
 				Type:    folder.Type,
-				MinFree: humanBytes(int64(folder.MinFree)),
+				MinFree: format.Bytes(int64(folder.MinFree)),
+				State:   "не измерено",
 			})
 		}
 	}
@@ -154,7 +184,7 @@ func (s *Server) buildView(r *http.Request) view {
 			Kind:       entry.Kind,
 			CreatedAt:  entry.CreatedAt.Format("2006-01-02 15:04"),
 			MovesCount: entry.MovesCount,
-			Bytes:      humanBytes(entry.Bytes),
+			Bytes:      format.Bytes(entry.Bytes),
 			State:      entry.State,
 			// A finished plan can be put back, even when a newer scan has
 			// already replaced the current one.

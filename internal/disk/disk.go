@@ -60,11 +60,17 @@ type Entry struct {
 	IsSymlink bool
 }
 
+// EntryProgress is called with the number of entries counted so far.
+//
+// The walk of a folder is the slow part of a scan, and the interface shows
+// how far it has come.
+type EntryProgress func(count int)
+
 // ListEntries returns the immediate children of dir, sorted by name.
 //
 // Hidden names and anything that is not a file, a directory or a symlink are
 // skipped: they are not media and cannot be copied.
-func ListEntries(dir string) ([]Entry, error) {
+func ListEntries(dir string, progress EntryProgress) ([]Entry, error) {
 	items, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -109,6 +115,11 @@ func ListEntries(dir string) ([]Entry, error) {
 				Size:    info.Size(),
 				ModTime: info.ModTime(),
 			})
+		default:
+			continue
+		}
+		if progress != nil {
+			progress(len(entries))
 		}
 	}
 	return entries, nil

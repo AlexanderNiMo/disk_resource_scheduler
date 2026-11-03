@@ -21,6 +21,10 @@ func newTestServer(t *testing.T) *httptest.Server {
 	cfg := &config.Config{
 		Server: config.Server{Listen: "127.0.0.1:0"},
 		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+		Folders: map[string]config.Folder{
+			"/media8/serials": {Path: "/media8/serials", DirType: config.DirTypeSrc, Type: 2, MinFree: 50 << 30},
+			"/media5/serials": {Path: "/media5/serials", DirType: config.DirTypeDst, Type: 2},
+		},
 	}
 	store := config.NewStore(cfg)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -218,5 +222,57 @@ func TestTheApiAnswersWithJson(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "\"state\"") {
 		t.Fatalf("the api answered with %s", body)
+	}
+}
+
+func TestTheDashboardSaysWhenNothingHasBeenScanned(t *testing.T) {
+	server := newTestServer(t)
+	client := login(t, server)
+
+	resp, err := client.Get(server.URL + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Сканирование ещё не выполнялось") {
+		t.Fatalf("the dashboard does not say that nothing was scanned: %s", body)
+	}
+	if !strings.Contains(string(body), "не измерено") {
+		t.Fatalf("the folders do not say that they were not measured: %s", body)
+	}
+}
+
+func TestApprovingBeforeTheFirstScanIsRefused(t *testing.T) {
+	server := newTestServer(t)
+	client := login(t, server)
+
+	page, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse the url: %v", err)
+	}
+	token := ""
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			token = cookie.Value
+		}
+	}
+
+	resp, err := client.PostForm(server.URL+"/api/plan/approve", url.Values{
+		"plan_id":    {"1"},
+		"csrf_token": {token},
+	})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("the approval returned %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "not been scanned") {
+		t.Fatalf("the answer is %s, want it to say that nothing was scanned", body)
 	}
 }

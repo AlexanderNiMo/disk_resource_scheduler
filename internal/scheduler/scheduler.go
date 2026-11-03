@@ -13,6 +13,7 @@ import (
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
 	"github.com/alex/disk_resource_scheduler/internal/disk"
+	"github.com/alex/disk_resource_scheduler/internal/format"
 )
 
 // State is what the scheduler is doing right now.
@@ -54,6 +55,11 @@ var (
 	ErrStalePlan = errors.New("the plan has changed")
 	// ErrBusy means an execution is already running.
 	ErrBusy = errors.New("something is already running")
+	// ErrNotScanned means the folders have not been measured yet: there is
+	// nothing to make a plan of.
+	ErrNotScanned = errors.New("the folders have not been scanned yet")
+	// ErrNothingToApprove means the plan has no moves in it.
+	ErrNothingToApprove = errors.New("there is nothing to approve")
 )
 
 // Plan is what the daemon proposes to do.
@@ -102,6 +108,26 @@ type Unmovable struct {
 	Reason string `json:"reason"`
 }
 
+// ScanStatus is what the scan is doing right now.
+//
+// The interface shows it: the walk of a big library takes a while, and a
+// page that says nothing about it looks broken.
+type ScanStatus struct {
+	Running bool
+	// Scanned tells whether the folders have been measured at least once.
+	// There is no plan before that.
+	Scanned bool
+	Started time.Time
+	// Folder is the folder being walked right now.
+	Folder string
+	// Entries is the number of entries counted in that folder so far.
+	Entries int
+	// Measured is the number of folders that have been measured.
+	Measured int
+	// Total is the number of folders in the configuration.
+	Total int
+}
+
 // Scheduler plans the moves and performs them.
 type Scheduler struct {
 	cfg     *config.Store
@@ -114,6 +140,8 @@ type Scheduler struct {
 	st   State
 	plan *Plan
 	next int
+	// scan is what the scan is doing right now.
+	scan ScanStatus
 
 	scanMu sync.Mutex
 	wg     sync.WaitGroup
@@ -144,21 +172,24 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	st, plan, err := s.store.Load()
 	if err != nil {
 		s.log.Warn("could not read the state file, starting empty", "error", err)
-		return nil
-	}
-	if plan == nil {
-		return nil
+	} else if plan != nil {
+		s.mu.Lock()
+		s.st, s.plan, s.next = st, plan, plan.ID
+		s.scan.Scanned = true
+		s.mu.Unlock()
+		s.log.Info("restored the plan", "state", st, "plan_id", plan.ID)
+
+		if st == StateRunning {
+			s.log.Info("resuming the interrupted execution", "plan_id", plan.ID)
+			s.run(func() { s.execute(plan, true) })
+		}
 	}
 
-	s.mu.Lock()
-	s.st, s.plan, s.next = st, plan, plan.ID
-	s.mu.Unlock()
-	s.log.Info("restored the plan", "state", st, "plan_id", plan.ID)
-
-	if st == StateRunning {
-		s.log.Info("resuming the interrupted execution", "plan_id", plan.ID)
-		s.run(func() { s.execute(plan, true) })
-	}
+	// The folders are measured right away: the daemon should not sit idle
+	// until the first tick of the cron, and there is no plan to make before
+	// the folders are known. A restored plan is not replaced: the scan skips
+	// itself while a plan waits for an approval.
+	s.run(func() { s.Scan(base) })
 	return nil
 }
 
@@ -198,6 +229,19 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	}
 
 	cfg := s.cfg.Load()
+	started := time.Now()
+	s.mu.Lock()
+	s.scan = ScanStatus{Running: true, Started: started, Total: len(cfg.Folders)}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.scan.Running = false
+		s.scan.Folder = ""
+		s.scan.Entries = 0
+		s.mu.Unlock()
+	}()
+
+	s.log.Info("the scan is started", "folders", len(cfg.Folders))
 	measured := s.gather(ctx, cfg)
 
 	s.mu.Lock()
@@ -205,16 +249,39 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	plan := buildPlan(cfg, measured, time.Now(), s.next)
 	s.plan = plan
 	s.st = StatePending
+	s.scan.Scanned = true
 	s.mu.Unlock()
 
+	for _, move := range plan.Moves {
+		s.log.Debug("the entry is planned to move",
+			"name", move.Name, "from", move.Src, "to", move.Dst, "size", format.Bytes(move.Size))
+	}
+	for _, entry := range plan.Unmovable {
+		s.log.Debug("the entry stays where it is",
+			"name", entry.Name, "folder", entry.Src, "size", format.Bytes(entry.Size),
+			"reason", entry.Reason)
+	}
+
+	if len(plan.Moves) == 0 {
+		// There is nothing to approve, so the plan is not worth keeping:
+		// the state file holds the last plan that had something in it.
+		s.log.Info("there is nothing to move",
+			"plan_id", plan.ID, "duration", time.Since(started).Round(time.Millisecond).String())
+		return nil
+	}
 	s.log.Info("the plan is ready",
-		"plan_id", plan.ID, "moves", len(plan.Moves), "unmovable", len(plan.Unmovable))
+		"plan_id", plan.ID, "moves", len(plan.Moves), "unmovable", len(plan.Unmovable),
+		"duration", time.Since(started).Round(time.Millisecond).String())
 	return s.save()
 }
 
 // Approve starts the execution of the current plan.
 func (s *Scheduler) Approve(planID int) error {
 	s.mu.Lock()
+	if !s.scan.Scanned {
+		s.mu.Unlock()
+		return ErrNotScanned
+	}
 	if s.plan == nil {
 		s.mu.Unlock()
 		return ErrNoPlan
@@ -222,6 +289,10 @@ func (s *Scheduler) Approve(planID int) error {
 	if s.plan.ID != planID {
 		s.mu.Unlock()
 		return ErrStalePlan
+	}
+	if len(s.plan.Moves) == 0 {
+		s.mu.Unlock()
+		return ErrNothingToApprove
 	}
 	if s.st == StateRunning || s.st == StateRollingBack {
 		s.mu.Unlock()
@@ -239,6 +310,10 @@ func (s *Scheduler) Approve(planID int) error {
 // Reject discards the current plan.
 func (s *Scheduler) Reject(planID int) error {
 	s.mu.Lock()
+	if !s.scan.Scanned {
+		s.mu.Unlock()
+		return ErrNotScanned
+	}
 	if s.plan == nil {
 		s.mu.Unlock()
 		return ErrNoPlan
@@ -264,6 +339,10 @@ func (s *Scheduler) Reject(planID int) error {
 // that were moved are still worth putting back.
 func (s *Scheduler) Rollback(planID, moveID int) error {
 	s.mu.Lock()
+	if !s.scan.Scanned {
+		s.mu.Unlock()
+		return ErrNotScanned
+	}
 	if s.st == StateRunning || s.st == StateRollingBack {
 		s.mu.Unlock()
 		return ErrBusy
@@ -326,15 +405,22 @@ func (s *Scheduler) planFromHistory(planID int) *Plan {
 func (s *Scheduler) Snapshot() (State, *Plan) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.st, copyPlan(s.plan)
+}
 
-	if s.plan == nil {
-		return s.st, nil
+// copyPlan returns a copy of the plan.
+//
+// The executor writes into the plan while it moves the files, so everything
+// that reads the plan outside the lock gets a copy of it.
+func copyPlan(plan *Plan) *Plan {
+	if plan == nil {
+		return nil
 	}
-	copied := *s.plan
-	copied.Folders = append([]FolderStatus(nil), s.plan.Folders...)
-	copied.Moves = append([]Move(nil), s.plan.Moves...)
-	copied.Unmovable = append([]Unmovable(nil), s.plan.Unmovable...)
-	return s.st, &copied
+	copied := *plan
+	copied.Folders = append([]FolderStatus(nil), plan.Folders...)
+	copied.Moves = append([]Move(nil), plan.Moves...)
+	copied.Unmovable = append([]Unmovable(nil), plan.Unmovable...)
+	return &copied
 }
 
 // measured is what a scan found on the disks.
@@ -362,24 +448,75 @@ func (s *Scheduler) gather(ctx context.Context, cfg *config.Config) measured {
 		volume, err := s.probe.VolumeOf(folder.Path)
 		if err != nil {
 			result.errors[folder.Path] = err.Error()
+			s.log.Error("could not measure the volume", "folder", folder.Path, "error", err)
 			continue
 		}
 		result.volumes[folder.Path] = volume
+		s.log.Debug("the volume of the folder",
+			"folder", folder.Path, "role", folder.DirType, "type", folder.Type,
+			"free", format.Bytes(volume.Free), "total", format.Bytes(volume.Total),
+			"threshold", format.Bytes(int64(folder.MinFree)))
 
 		if folder.DirType != config.DirTypeSrc {
 			continue
 		}
 		if volume.Free >= int64(folder.MinFree) {
+			s.log.Debug("there is enough free space on the volume",
+				"folder", folder.Path, "free", format.Bytes(volume.Free),
+				"threshold", format.Bytes(int64(folder.MinFree)))
 			continue
 		}
-		entries, err := disk.ListEntries(folder.Path)
+
+		walked := time.Now()
+		s.setScanFolder(folder.Path)
+		entries, err := disk.ListEntries(folder.Path, func(count int) { s.setScanEntries(count) })
 		if err != nil {
 			result.errors[folder.Path] = err.Error()
+			s.log.Error("could not read the folder", "folder", folder.Path, "error", err)
 			continue
 		}
+		var total int64
+		for _, entry := range entries {
+			total += entry.Size
+		}
+		s.log.Info("the folder is below the threshold, its entries are counted",
+			"folder", folder.Path, "type", folder.Type,
+			"free", format.Bytes(volume.Free), "threshold", format.Bytes(int64(folder.MinFree)),
+			"entries", len(entries), "size", format.Bytes(total),
+			"duration", time.Since(walked).Round(time.Millisecond).String())
 		result.entries[folder.Path] = entries
+		s.setScanMeasured()
 	}
 	return result
+}
+
+// setScanFolder says which folder the scan is walking right now.
+func (s *Scheduler) setScanFolder(path string) {
+	s.mu.Lock()
+	s.scan.Folder = path
+	s.scan.Entries = 0
+	s.mu.Unlock()
+}
+
+// setScanEntries says how many entries of that folder have been counted.
+func (s *Scheduler) setScanEntries(count int) {
+	s.mu.Lock()
+	s.scan.Entries = count
+	s.mu.Unlock()
+}
+
+// setScanMeasured counts a folder that has been measured.
+func (s *Scheduler) setScanMeasured() {
+	s.mu.Lock()
+	s.scan.Measured++
+	s.mu.Unlock()
+}
+
+// ScanStatus returns what the scan is doing right now.
+func (s *Scheduler) ScanStatus() ScanStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.scan
 }
 
 // buildPlan turns what was measured into a plan.
@@ -578,12 +715,15 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 		s.transfer(plan, i, move.DstPath, move.Path, false, StatusRolledBack)
 	}
 
+	s.mu.RLock()
 	failed := false
 	for _, move := range plan.Moves {
 		if move.Status == StatusFailed {
 			failed = true
 		}
 	}
+	s.mu.RUnlock()
+
 	st := StateDone
 	if failed {
 		st = StateFailed
@@ -625,8 +765,12 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, clean bool,
 		}
 		s.setAttempt(plan, index, attempt)
 
+		started := time.Now()
 		err := disk.Move(from, to, func(copied int64) { s.setProgress(plan, index, copied) })
 		if err == nil {
+			s.log.Info("the entry is moved",
+				"from", from, "to", to, "attempt", attempt,
+				"duration", time.Since(started).Round(time.Millisecond).String())
 			s.setMove(plan, index, okStatus, "")
 			return
 		}
@@ -720,15 +864,21 @@ func (s *Scheduler) setProgress(plan *Plan, index int, copied int64) {
 }
 
 func (s *Scheduler) appendHistory(plan *Plan, kind string, st State, at time.Time) {
+	// The copy is taken under the lock: the executor writes into the plan
+	// while it moves the files.
+	s.mu.RLock()
+	copied := copyPlan(plan)
+	s.mu.RUnlock()
+
 	entry := HistoryEntry{
-		ID:         plan.ID,
+		ID:         copied.ID,
 		Kind:       kind,
 		CreatedAt:  at,
 		State:      string(st),
-		MovesCount: len(plan.Moves),
-		Plan:       plan,
+		MovesCount: len(copied.Moves),
+		Plan:       copied,
 	}
-	for _, move := range plan.Moves {
+	for _, move := range copied.Moves {
 		entry.Bytes += move.Size
 	}
 	if err := s.history.Append(entry); err != nil {
@@ -738,7 +888,8 @@ func (s *Scheduler) appendHistory(plan *Plan, kind string, st State, at time.Tim
 
 func (s *Scheduler) save() error {
 	s.mu.RLock()
-	st, plan := s.st, s.plan
+	st := s.st
+	plan := copyPlan(s.plan)
 	s.mu.RUnlock()
 
 	if err := s.store.Save(st, plan); err != nil {

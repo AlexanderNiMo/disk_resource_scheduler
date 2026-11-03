@@ -13,6 +13,7 @@ import (
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
 	"github.com/alex/disk_resource_scheduler/internal/disk"
+	"github.com/alex/disk_resource_scheduler/internal/format"
 )
 
 // State is what the scheduler is doing right now.
@@ -198,6 +199,8 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	}
 
 	cfg := s.cfg.Load()
+	started := time.Now()
+	s.log.Info("the scan is started", "folders", len(cfg.Folders))
 	measured := s.gather(ctx, cfg)
 
 	s.mu.Lock()
@@ -207,14 +210,26 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	s.st = StatePending
 	s.mu.Unlock()
 
+	for _, move := range plan.Moves {
+		s.log.Debug("the entry is planned to move",
+			"name", move.Name, "from", move.Src, "to", move.Dst, "size", format.Bytes(move.Size))
+	}
+	for _, entry := range plan.Unmovable {
+		s.log.Debug("the entry stays where it is",
+			"name", entry.Name, "folder", entry.Src, "size", format.Bytes(entry.Size),
+			"reason", entry.Reason)
+	}
+
 	if len(plan.Moves) == 0 {
 		// There is nothing to approve, so the plan is not worth keeping:
 		// the state file holds the last plan that had something in it.
-		s.log.Info("there is nothing to move", "plan_id", plan.ID)
+		s.log.Info("there is nothing to move",
+			"plan_id", plan.ID, "duration", time.Since(started).Round(time.Millisecond).String())
 		return nil
 	}
 	s.log.Info("the plan is ready",
-		"plan_id", plan.ID, "moves", len(plan.Moves), "unmovable", len(plan.Unmovable))
+		"plan_id", plan.ID, "moves", len(plan.Moves), "unmovable", len(plan.Unmovable),
+		"duration", time.Since(started).Round(time.Millisecond).String())
 	return s.save()
 }
 
@@ -368,21 +383,41 @@ func (s *Scheduler) gather(ctx context.Context, cfg *config.Config) measured {
 		volume, err := s.probe.VolumeOf(folder.Path)
 		if err != nil {
 			result.errors[folder.Path] = err.Error()
+			s.log.Error("could not measure the volume", "folder", folder.Path, "error", err)
 			continue
 		}
 		result.volumes[folder.Path] = volume
+		s.log.Debug("the volume of the folder",
+			"folder", folder.Path, "role", folder.DirType, "type", folder.Type,
+			"free", format.Bytes(volume.Free), "total", format.Bytes(volume.Total),
+			"threshold", format.Bytes(int64(folder.MinFree)))
 
 		if folder.DirType != config.DirTypeSrc {
 			continue
 		}
 		if volume.Free >= int64(folder.MinFree) {
+			s.log.Debug("there is enough free space on the volume",
+				"folder", folder.Path, "free", format.Bytes(volume.Free),
+				"threshold", format.Bytes(int64(folder.MinFree)))
 			continue
 		}
+
+		walked := time.Now()
 		entries, err := disk.ListEntries(folder.Path)
 		if err != nil {
 			result.errors[folder.Path] = err.Error()
+			s.log.Error("could not read the folder", "folder", folder.Path, "error", err)
 			continue
 		}
+		var total int64
+		for _, entry := range entries {
+			total += entry.Size
+		}
+		s.log.Info("the folder is below the threshold, its entries are counted",
+			"folder", folder.Path, "type", folder.Type,
+			"free", format.Bytes(volume.Free), "threshold", format.Bytes(int64(folder.MinFree)),
+			"entries", len(entries), "size", format.Bytes(total),
+			"duration", time.Since(walked).Round(time.Millisecond).String())
 		result.entries[folder.Path] = entries
 	}
 	return result
@@ -631,8 +666,12 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, clean bool,
 		}
 		s.setAttempt(plan, index, attempt)
 
+		started := time.Now()
 		err := disk.Move(from, to, func(copied int64) { s.setProgress(plan, index, copied) })
 		if err == nil {
+			s.log.Info("the entry is moved",
+				"from", from, "to", to, "attempt", attempt,
+				"duration", time.Since(started).Round(time.Millisecond).String())
 			s.setMove(plan, index, okStatus, "")
 			return
 		}

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/alex/disk_resource_scheduler/internal/format"
 	"github.com/alex/disk_resource_scheduler/internal/scheduler"
 )
 
@@ -105,9 +106,9 @@ func (s *Server) buildView(r *http.Request) view {
 				Path:    folder.Path,
 				Role:    roleText(folder.DirType),
 				Type:    folder.Type,
-				Free:    humanBytes(folder.Free),
-				Total:   humanBytes(folder.Total),
-				MinFree: humanBytes(folder.MinFree),
+				Free:    format.Bytes(folder.Free),
+				Total:   format.Bytes(folder.Total),
+				MinFree: format.Bytes(folder.MinFree),
 				State:   folderStateText(folder.State),
 				Error:   folder.Error,
 			})
@@ -116,7 +117,7 @@ func (s *Server) buildView(r *http.Request) view {
 			result.Plan.Rows = append(result.Plan.Rows, moveRow{
 				ID:      move.ID,
 				Name:    move.Name,
-				Size:    humanBytes(move.Size),
+				Size:    format.Bytes(move.Size),
 				Src:     move.Src,
 				Dst:     move.Dst,
 				Status:  moveStatusText(move.Status),
@@ -131,7 +132,7 @@ func (s *Server) buildView(r *http.Request) view {
 		for _, entry := range plan.Unmovable {
 			result.Plan.Unmovable = append(result.Plan.Unmovable, unmovableRow{
 				Name:   entry.Name,
-				Size:   humanBytes(entry.Size),
+				Size:   format.Bytes(entry.Size),
 				Src:    entry.Src,
 				Reason: entry.Reason,
 			})
@@ -142,7 +143,7 @@ func (s *Server) buildView(r *http.Request) view {
 				Path:    folder.Path,
 				Role:    roleText(string(folder.DirType)),
 				Type:    folder.Type,
-				MinFree: humanBytes(int64(folder.MinFree)),
+				MinFree: format.Bytes(int64(folder.MinFree)),
 			})
 		}
 	}
@@ -157,7 +158,7 @@ func (s *Server) buildView(r *http.Request) view {
 			Kind:       entry.Kind,
 			CreatedAt:  entry.CreatedAt.Format("2006-01-02 15:04"),
 			MovesCount: entry.MovesCount,
-			Bytes:      humanBytes(entry.Bytes),
+			Bytes:      format.Bytes(entry.Bytes),
 			State:      entry.State,
 			// A finished plan can be put back, even when a newer scan has
 			// already replaced the current one.

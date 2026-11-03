@@ -7,6 +7,8 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+
+	"github.com/alex/disk_resource_scheduler/internal/format"
 )
 
 //go:embed views
@@ -28,7 +30,7 @@ type templates struct {
 func newTemplates() (*templates, error) {
 	funcs := template.FuncMap{
 		// bytes renders a file size the way a person reads it.
-		"bytes": humanBytes,
+		"bytes": format.Bytes,
 	}
 
 	tmpl := &templates{set: make(map[string]*template.Template, len(pageNames))}
@@ -94,21 +96,4 @@ func (s *Server) renderFragment(w http.ResponseWriter, r *http.Request, name str
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = buf.WriteTo(w)
-}
-
-// humanBytes renders a file size the way a person reads it.
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d Б", n)
-	}
-
-	value := float64(n)
-	for _, u := range []string{"КиБ", "МиБ", "ГиБ", "ТиБ"} {
-		value /= unit
-		if value < unit {
-			return fmt.Sprintf("%.1f %s", value, u)
-		}
-	}
-	return fmt.Sprintf("%.1f ПиБ", value)
 }

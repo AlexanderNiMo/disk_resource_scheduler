@@ -93,9 +93,12 @@ func (s *Server) buildView(r *http.Request) view {
 	if plan != nil {
 		result.Plan.HasPlan = true
 		result.Plan.PlanID = plan.ID
-		result.Plan.CanApprove = state == scheduler.StatePending
+		result.Plan.CanApprove = state == scheduler.StatePending && len(plan.Moves) > 0
 		result.Plan.CanReject = state == scheduler.StatePending
 		result.Plan.CanRollback = state == scheduler.StateDone || state == scheduler.StateFailed
+		if len(plan.Moves) == 0 {
+			result.Plan.StateText = "переносить нечего: на всех источниках достаточно свободного места"
+		}
 
 		for _, folder := range plan.Folders {
 			result.Folders = append(result.Folders, folderRow{

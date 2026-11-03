@@ -207,6 +207,12 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	s.st = StatePending
 	s.mu.Unlock()
 
+	if len(plan.Moves) == 0 {
+		// There is nothing to approve, so the plan is not worth keeping:
+		// the state file holds the last plan that had something in it.
+		s.log.Info("there is nothing to move", "plan_id", plan.ID)
+		return nil
+	}
 	s.log.Info("the plan is ready",
 		"plan_id", plan.ID, "moves", len(plan.Moves), "unmovable", len(plan.Unmovable))
 	return s.save()

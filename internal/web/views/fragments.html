@@ -24,6 +24,7 @@
       </form>
     </div>
 
+    {{if .Plan.Rows}}
     <table>
       <thead>
         <tr><th>Что</th><th>Размер</th><th>Откуда</th><th>Куда</th><th>Состояние</th><th></th></tr>
@@ -53,6 +54,7 @@
       {{end}}
       </tbody>
     </table>
+    {{end}}
 
     {{if .Plan.Unmovable}}
     <h3>Не переносится</h3>

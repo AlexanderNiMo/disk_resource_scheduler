@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"net/http"
+	"strings"
 )
 
 // handleLoginForm shows the login page.
@@ -50,13 +52,17 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // handleDashboard shows the folders, the plan and the history.
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	s.render(w, r, "dashboard", s.buildView(r))
+	s.render(w, r, "dashboard", s.buildView(r, true))
 }
 
 // handlePlanFragment is the part of the page that is polled.
+//
+// The history is not in the fragment, so it is not read: the file holds
+// every plan ever made, and reading it every few seconds would cost more
+// than the rest of the page.
 func (s *Server) handlePlanFragment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	s.renderFragment(w, r, "plan_block", s.buildView(r))
+	s.renderFragment(w, r, "plan_block", s.buildView(r, false))
 }
 
 // handleScan starts a scan.
@@ -65,46 +71,65 @@ func (s *Server) handlePlanFragment(w http.ResponseWriter, r *http.Request) {
 // background: the page shows the plan as soon as it is ready.
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	go func() {
-		if err := s.sch.Scan(r.Context()); err != nil {
+		// The context of the request is cancelled when the request ends,
+		// and the scan would stop at the first folder. It runs on the
+		// context of the daemon instead.
+		if err := s.sch.Scan(context.Background()); err != nil {
 			s.log.Error("the scan failed", "error", err)
 		}
 	}()
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	s.answer(w, r, http.StatusAccepted, map[string]string{"status": "scanning"})
 }
 
 // handleApprove starts the execution of the plan.
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
-	err := s.sch.Approve(formInt(r, "plan_id"))
-	if err != nil {
-		s.renderError(w, r, err)
+	if err := s.sch.Approve(formInt(r, "plan_id")); err != nil {
+		s.fail(w, r, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	s.answer(w, r, http.StatusAccepted, map[string]string{"status": "approved"})
 }
 
 // handleReject throws the plan away.
 func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
-	err := s.sch.Reject(formInt(r, "plan_id"))
-	if err != nil {
-		s.renderError(w, r, err)
+	if err := s.sch.Reject(formInt(r, "plan_id")); err != nil {
+		s.fail(w, r, err)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	s.answer(w, r, http.StatusOK, map[string]string{"status": "rejected"})
 }
 
 // handleRollback puts one move back, or all of them when move_id is zero.
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
-	err := s.sch.Rollback(formInt(r, "plan_id"), formInt(r, "move_id"))
-	if err != nil {
-		s.renderError(w, r, err)
+	if err := s.sch.Rollback(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.answer(w, r, http.StatusAccepted, map[string]string{"status": "rolling back"})
+}
+
+// answer finishes a request: JSON for the API, a page otherwise.
+func (s *Server) answer(w http.ResponseWriter, r *http.Request, status int, payload map[string]string) {
+	if isAPI(r) {
+		writeJSON(w, status, payload)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-// renderError shows the dashboard with the error on it.
-func (s *Server) renderError(w http.ResponseWriter, r *http.Request, err error) {
-	view := s.buildView(r)
+// fail reports an error: JSON for the API, the page with the error on it
+// otherwise.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
+	if isAPI(r) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	view := s.buildView(r, true)
 	view.Error = err.Error()
 	s.render(w, r, "dashboard", view)
+}
+
+// isAPI tells whether the request wants JSON instead of a page.
+func isAPI(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, "/api/")
 }

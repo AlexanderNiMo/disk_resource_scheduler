@@ -43,6 +43,11 @@ const (
 	// progressStep is how much has to be copied before the interface is told
 	// about it: every chunk would be a lock and a redraw.
 	progressStep = 4 << 20
+
+	// saveEveryMoves is how many changes of a move go into the state file
+	// before it is written again. The file holds the whole plan, so writing
+	// it after every move would rewrite hundreds of kilobytes per move.
+	saveEveryMoves = 100
 )
 
 // retryPause is how long to wait between two attempts at the same move.
@@ -140,6 +145,9 @@ type Scheduler struct {
 	st   State
 	plan *Plan
 	next int
+	// dirty counts the changes of the moves that are not in the state file
+	// yet.
+	dirty int
 	// scan is what the scan is doing right now.
 	scan ScanStatus
 
@@ -248,8 +256,15 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	s.next++
 	plan := buildPlan(cfg, measured, time.Now(), s.next)
 	s.plan = plan
-	s.st = StatePending
 	s.scan.Scanned = true
+	if len(plan.Moves) == 0 {
+		// Nothing to approve. The state stays idle, because a plan that
+		// waits for an approval stops the next scan: the daemon would
+		// never measure the disks again.
+		s.st = StateIdle
+	} else {
+		s.st = StatePending
+	}
 	s.mu.Unlock()
 
 	for _, move := range plan.Moves {
@@ -423,13 +438,6 @@ func copyPlan(plan *Plan) *Plan {
 	return &copied
 }
 
-// measured is what a scan found on the disks.
-type measured struct {
-	volumes map[string]disk.Volume
-	entries map[string][]disk.Entry
-	errors  map[string]string
-}
-
 // gather measures the folders.
 //
 // The walk of a src folder is the expensive part, so it happens only when that
@@ -452,6 +460,7 @@ func (s *Scheduler) gather(ctx context.Context, cfg *config.Config) measured {
 			continue
 		}
 		result.volumes[folder.Path] = volume
+		s.setScanMeasured()
 		s.log.Debug("the volume of the folder",
 			"folder", folder.Path, "role", folder.DirType, "type", folder.Type,
 			"free", format.Bytes(volume.Free), "total", format.Bytes(volume.Total),
@@ -485,7 +494,6 @@ func (s *Scheduler) gather(ctx context.Context, cfg *config.Config) measured {
 			"entries", len(entries), "size", format.Bytes(total),
 			"duration", time.Since(walked).Round(time.Millisecond).String())
 		result.entries[folder.Path] = entries
-		s.setScanMeasured()
 	}
 	return result
 }
@@ -505,7 +513,7 @@ func (s *Scheduler) setScanEntries(count int) {
 	s.mu.Unlock()
 }
 
-// setScanMeasured counts a folder that has been measured.
+// setScanMeasured counts a folder whose volume has been measured.
 func (s *Scheduler) setScanMeasured() {
 	s.mu.Lock()
 	s.scan.Measured++
@@ -517,145 +525,6 @@ func (s *Scheduler) ScanStatus() ScanStatus {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.scan
-}
-
-// buildPlan turns what was measured into a plan.
-//
-// Pure: everything it needs is in the arguments and it touches no disk. That
-// is what makes the interesting part — which entry goes where — testable
-// without a disk.
-func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan {
-	plan := &Plan{ID: planID, CreatedAt: now}
-	folders := cfg.Sorted()
-
-	// The simulated free space of every volume. Folders on one volume share
-	// the number, so two sources on one disk do not each plan for the same
-	// deficit.
-	free := map[uint64]int64{}
-	for _, folder := range folders {
-		volume := m.volumes[folder.Path]
-		free[volume.Dev] = volume.Free
-	}
-
-	for _, folder := range folders {
-		volume := m.volumes[folder.Path]
-		status := FolderStatus{
-			Path:    folder.Path,
-			DirType: string(folder.DirType),
-			Type:    folder.Type,
-			Free:    volume.Free,
-			Total:   volume.Total,
-			MinFree: int64(folder.MinFree),
-		}
-		switch {
-		case m.errors[folder.Path] != "":
-			status.State, status.Error = "error", m.errors[folder.Path]
-		case folder.DirType == config.DirTypeSrc && volume.Free < int64(folder.MinFree):
-			status.State = "low"
-		default:
-			status.State = "ok"
-		}
-		plan.Folders = append(plan.Folders, status)
-	}
-
-	minAge := time.Duration(cfg.Scan.MinAge)
-	for _, folder := range folders {
-		if folder.DirType != config.DirTypeSrc {
-			continue
-		}
-		volume := m.volumes[folder.Path]
-		deficit := int64(folder.MinFree) - free[volume.Dev]
-		if deficit <= 0 {
-			continue
-		}
-
-		entries := m.entries[folder.Path]
-		// The biggest first: it frees the most space per move, so the fewest
-		// entries have to move. The name breaks the tie, so the plan is the
-		// same on every run.
-		sort.Slice(entries, func(i, j int) bool {
-			if entries[i].Size != entries[j].Size {
-				return entries[i].Size > entries[j].Size
-			}
-			return entries[i].Name < entries[j].Name
-		})
-
-		freed := int64(0)
-		for _, entry := range entries {
-			if freed >= deficit {
-				break
-			}
-			if entry.ModTime.After(now.Add(-minAge)) {
-				plan.Unmovable = append(plan.Unmovable, Unmovable{
-					Src: folder.Path, Name: entry.Name, Path: entry.Path, Size: entry.Size,
-					Reason: "изменён меньше суток назад",
-				})
-				continue
-			}
-
-			dst, dstVolume, ok := pickDestination(folders, m, free, entry, folder.Type, volume.Dev)
-			if !ok {
-				plan.Unmovable = append(plan.Unmovable, Unmovable{
-					Src: folder.Path, Name: entry.Name, Path: entry.Path, Size: entry.Size,
-					Reason: "нет папки-приёмника с таким type и достаточным местом",
-				})
-				continue
-			}
-			if _, err := os.Lstat(dst.Path + "/" + entry.Name); err == nil {
-				plan.Unmovable = append(plan.Unmovable, Unmovable{
-					Src: folder.Path, Name: entry.Name, Path: entry.Path, Size: entry.Size,
-					Reason: "в приёмнике уже есть такой файл",
-				})
-				continue
-			}
-
-			plan.Moves = append(plan.Moves, Move{
-				ID:      len(plan.Moves) + 1,
-				Src:     folder.Path,
-				Name:    entry.Name,
-				Path:    entry.Path,
-				Dst:     dst.Path,
-				DstPath: dst.Path + "/" + entry.Name,
-				Size:    entry.Size,
-				Type:    folder.Type,
-				Status:  StatusPending,
-			})
-			free[dstVolume.Dev] -= entry.Size
-			free[volume.Dev] += entry.Size
-			freed += entry.Size
-		}
-	}
-	return plan
-}
-
-// pickDestination chooses where an entry goes: the dst folder of the same
-// type on another volume with the most free space, that can still take it.
-func pickDestination(folders []config.Folder, m measured, free map[uint64]int64, entry disk.Entry, wantType int, srcDev uint64) (config.Folder, disk.Volume, bool) {
-	var best config.Folder
-	var bestVolume disk.Volume
-	bestFree := int64(-1)
-
-	for _, candidate := range folders {
-		if candidate.DirType != config.DirTypeDst || candidate.Type != wantType {
-			continue
-		}
-		if m.errors[candidate.Path] != "" {
-			continue
-		}
-		volume := m.volumes[candidate.Path]
-		if volume.Dev == srcDev {
-			// A move inside one volume frees nothing, so it would never
-			// close the deficit.
-			continue
-		}
-		if free[volume.Dev]-int64(candidate.MinFree) < entry.Size {
-			continue
-		}
-		if free[volume.Dev] > bestFree {
-			best, bestVolume, bestFree = candidate, volume, free[volume.Dev]
-		}
-	}
-	return best, bestVolume, bestFree >= 0
 }
 
 // execute performs the moves of a plan.
@@ -677,18 +546,23 @@ func (s *Scheduler) execute(plan *Plan, resume bool) {
 			continue
 		}
 
-		clean := false
-		if resume && move.Status == StatusMoving {
-			// The copy may have finished before the crash: the source is
-			// gone only then, and deleting the destination now would throw
-			// away a good copy.
-			if _, err := os.Stat(move.Path); errors.Is(err, os.ErrNotExist) {
+		if resume {
+			// The files say what happened, not the saved status: it can be
+			// up to a hundred moves behind.
+			_, sourceErr := os.Stat(move.Path)
+			_, destErr := os.Stat(move.DstPath)
+			switch {
+			case sourceErr != nil && destErr == nil:
+				// The copy finished before the crash; only the status was
+				// not saved.
 				s.setMove(plan, i, StatusDone, "")
 				continue
+			case sourceErr != nil:
+				s.setMove(plan, i, StatusFailed, "источника нет на месте")
+				continue
 			}
-			clean = true
 		}
-		s.transfer(plan, i, move.Path, move.DstPath, clean, StatusDone)
+		s.transfer(plan, i, move.Path, move.DstPath, StatusDone)
 	}
 	s.finish(plan, "plan")
 }
@@ -704,6 +578,10 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 		move := plan.Moves[i]
 		s.mu.RUnlock()
 
+		if err := s.stillConfigured(move); err != nil {
+			s.setMove(plan, i, StatusFailed, err.Error())
+			continue
+		}
 		if _, err := os.Lstat(move.DstPath); err != nil {
 			s.setMove(plan, i, StatusFailed, "файла на месте назначения нет")
 			continue
@@ -712,7 +590,7 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 			s.setMove(plan, i, StatusFailed, "на месте источника уже есть файл")
 			continue
 		}
-		s.transfer(plan, i, move.DstPath, move.Path, false, StatusRolledBack)
+		s.transfer(plan, i, move.DstPath, move.Path, StatusRolledBack)
 	}
 
 	s.mu.RLock()
@@ -745,28 +623,33 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 
 // transfer moves one entry and records the outcome.
 //
-// clean says the destination is ours to remove: a partial copy from an
-// earlier attempt. It is never set for a file we did not create.
-func (s *Scheduler) transfer(plan *Plan, index int, from, to string, clean bool, okStatus string) {
+// The destination is never touched: the copy goes to a name of its own and is
+// put in place at the end, so that a file the daemon did not create is never
+// overwritten and never deleted.
+func (s *Scheduler) transfer(plan *Plan, index int, from, to string, okStatus string) {
 	s.setMove(plan, index, StatusMoving, "")
 
 	var lastErr error
 	for attempt := 1; attempt <= moveAttempts; attempt++ {
-		if attempt == 1 && !clean {
+		if attempt == 1 {
 			if _, err := os.Lstat(to); err == nil {
 				s.setMove(plan, index, StatusFailed, "на месте назначения уже есть файл")
 				return
 			}
-		} else {
-			// The destination is ours: a partial copy from an earlier attempt.
-			// The retry starts from scratch — finishing a partial copy
-			// would leave a broken file behind.
-			os.RemoveAll(to)
 		}
 		s.setAttempt(plan, index, attempt)
 
 		started := time.Now()
-		err := disk.Move(from, to, func(copied int64) { s.setProgress(plan, index, copied) })
+		var published int64
+		err := disk.Move(from, to, func(copied int64) {
+			// The copy calls this for every chunk; only every few
+			// megabytes is worth a lock.
+			if copied-published < progressStep {
+				return
+			}
+			published = copied
+			s.setProgress(plan, index, copied)
+		})
 		if err == nil {
 			s.log.Info("the entry is moved",
 				"from", from, "to", to, "attempt", attempt,
@@ -844,8 +727,17 @@ func (s *Scheduler) setMove(plan *Plan, index int, status, message string) {
 	s.mu.Lock()
 	plan.Moves[index].Status = status
 	plan.Moves[index].Error = message
+	s.dirty++
+	write := s.dirty >= saveEveryMoves ||
+		status == StatusDone || status == StatusFailed || status == StatusRolledBack
+	if write {
+		s.dirty = 0
+	}
 	s.mu.Unlock()
-	s.save()
+
+	if write {
+		s.save()
+	}
 }
 
 func (s *Scheduler) setAttempt(plan *Plan, index, attempt int) {
@@ -857,9 +749,6 @@ func (s *Scheduler) setAttempt(plan *Plan, index, attempt int) {
 func (s *Scheduler) setProgress(plan *Plan, index int, copied int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if copied-plan.Moves[index].Copied < progressStep {
-		return
-	}
 	plan.Moves[index].Copied = copied
 }
 

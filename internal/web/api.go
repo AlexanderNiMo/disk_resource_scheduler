@@ -6,7 +6,8 @@ import (
 )
 
 // The API is the same daemon as the interface, seen from a script: the same
-// session, the same CSRF token, the same actions.
+// session, the same CSRF token, the same actions. The write actions are the
+// handlers of the pages; only the two reads are here.
 
 // apiPlan returns the current state, the plan and the history.
 func (s *Server) apiPlan(w http.ResponseWriter, r *http.Request) {
@@ -30,43 +31,6 @@ func (s *Server) apiHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, history)
-}
-
-// apiScan starts a scan.
-func (s *Server) apiScan(w http.ResponseWriter, r *http.Request) {
-	go func() {
-		if err := s.sch.Scan(r.Context()); err != nil {
-			s.log.Error("the scan failed", "error", err)
-		}
-	}()
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "scanning"})
-}
-
-// apiApprove starts the execution of the plan.
-func (s *Server) apiApprove(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Approve(formInt(r, "plan_id")); err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "approved"})
-}
-
-// apiReject throws the plan away.
-func (s *Server) apiReject(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Reject(formInt(r, "plan_id")); err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "rejected"})
-}
-
-// apiRollback puts one move back, or all of them when move_id is zero.
-func (s *Server) apiRollback(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Rollback(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "rolling back"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

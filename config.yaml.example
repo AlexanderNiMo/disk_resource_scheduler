@@ -12,9 +12,15 @@ log:
   format: text
 
 server:
-  listen: "0.0.0.0:8088"
+  # The interface listens on the loopback only: the password and the session
+  # would travel in clear text over the network. To reach it from another
+  # machine, use a tunnel:
+  #   ssh -L 8088:127.0.0.1:8088 media-server
+  # or put a reverse proxy with TLS in front of it and set base_url to
+  # https://... .
+  listen: "127.0.0.1:8088"
   # Only used to decide whether the cookies get the Secure flag.
-  base_url: "http://disk.lan:8088"
+  base_url: "http://127.0.0.1:8088"
 
 # When the folders are looked at. An ordinary cron expression.
 scan:

@@ -326,8 +326,38 @@ func TestAnEmptyPlanIsNotSaved(t *testing.T) {
 	if plan == nil || len(plan.Moves) != 0 {
 		t.Fatalf("the plan is %+v, want an empty one", plan)
 	}
-	if state != StatePending {
-		t.Fatalf("the state is %s, want %s", state, StatePending)
+	// The state is idle, not pending: a plan that waits for an approval
+	// stops the next scan, and the daemon would never measure the disks
+	// again.
+	if state != StateIdle {
+		t.Fatalf("the state is %s, want %s", state, StateIdle)
+	}
+}
+
+func TestTheDaemonKeepsScanningAfterAnEmptyPlan(t *testing.T) {
+	sch := newTestScheduler(t, &config.Config{
+		Folders: map[string]config.Folder{
+			"/src": folder("/src", config.DirTypeSrc, 2, 50*gb),
+			"/dst": folder("/dst", config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}, fakeProbe{volumes: map[string]disk.Volume{
+		"/src": {Dev: 1, Free: 500 * gb},
+		"/dst": {Dev: 2, Free: 500 * gb},
+	}})
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("the first scan: %v", err)
+	}
+	_, first := sch.Snapshot()
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("the second scan: %v", err)
+	}
+	_, second := sch.Snapshot()
+
+	if second.ID == first.ID {
+		t.Fatalf("the second scan did nothing: the plan id is still %d", second.ID)
 	}
 }
 
@@ -554,6 +584,54 @@ func TestMoveIsRetriedAfterAFailure(t *testing.T) {
 		t.Fatal("the failure was not recorded")
 	}
 	// The source is still there: a failed move changes nothing.
+	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
+		t.Fatalf("the source is gone: %v", err)
+	}
+}
+
+func TestAMoveNeverTouchesAFileItDidNotCreate(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("ours"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	sch := newTestScheduler(t, cfg, probe)
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+
+	// Somebody puts a file of the same name in the destination after the
+	// plan was made.
+	os.WriteFile(filepath.Join(dst, "movie.mkv"), []byte("not ours"), 0o644)
+
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	waitFor(t, "the move to fail", func() bool {
+		state, _ := sch.Snapshot()
+		return state == StateFailed
+	})
+
+	body, err := os.ReadFile(filepath.Join(dst, "movie.mkv"))
+	if err != nil || string(body) != "not ours" {
+		t.Fatalf("the file in the destination is %q %v, want it untouched", body, err)
+	}
+	// And the source is still there: a failed move changes nothing.
 	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
 		t.Fatalf("the source is gone: %v", err)
 	}

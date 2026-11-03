@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -447,5 +448,160 @@ func TestAChangedPasswordEndsTheSession(t *testing.T) {
 
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("the dashboard returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
+	}
+}
+
+// fixedProbe reports the volumes a test wants.
+type fixedProbe map[string]disk.Volume
+
+func (p fixedProbe) VolumeOf(path string) (disk.Volume, error) {
+	volume, ok := p[path]
+	if !ok {
+		return disk.Volume{}, os.ErrNotExist
+	}
+	return volume, nil
+}
+
+// planPayload is what the API answers with.
+type planPayload struct {
+	State string `json:"state"`
+	Plan  struct {
+		ID    int `json:"id"`
+		Moves []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+		} `json:"moves"`
+	} `json:"plan"`
+}
+
+// getPlan asks the API for the current plan.
+func getPlan(t *testing.T, client *http.Client, base string) planPayload {
+	t.Helper()
+
+	resp, err := client.Get(base + "/api/plan")
+	if err != nil {
+		t.Fatalf("get the plan: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the api returned %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	var payload planPayload
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode the plan: %v", err)
+	}
+	return payload
+}
+
+// csrfToken returns the token the client already has.
+func csrfToken(t *testing.T, client *http.Client, base string) string {
+	t.Helper()
+
+	page, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse the url: %v", err)
+	}
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			return cookie.Value
+		}
+	}
+	t.Fatal("the client has no csrf token")
+	return ""
+}
+
+func TestAFileCanBeTakenOutOfThePlan(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+		Scan:   config.Scan{MinAge: config.Duration(0)},
+		Folders: map[string]config.Folder{
+			src: {Path: src, DirType: config.DirTypeSrc, Type: 2, MinFree: 50 << 30},
+			dst: {Path: dst, DirType: config.DirTypeDst, Type: 2},
+		},
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	sch := scheduler.New(store, logger, fixedProbe{
+		src: {Dev: 1, Free: 1 << 30},
+		dst: {Dev: 2, Free: 500 << 30},
+	}, scheduler.NewStateStore(t.TempDir()), history)
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	client := login(t, httpServer)
+	token := csrfToken(t, client, httpServer.URL)
+
+	resp, err := client.PostForm(httpServer.URL+"/scan", url.Values{"csrf_token": {token}})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	// The scan runs after the answer.
+	var plan planPayload
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		plan = getPlan(t, client, httpServer.URL)
+		if len(plan.Plan.Moves) == 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(plan.Plan.Moves) != 1 {
+		t.Fatalf("the plan has %d moves, want 1", len(plan.Plan.Moves))
+	}
+
+	// The page offers to take the file out of the plan.
+	resp, err = client.Get(httpServer.URL + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(string(body), "Убрать из плана") {
+		t.Fatalf("the dashboard does not offer to take the file out: %s", body)
+	}
+
+	resp, err = client.PostForm(httpServer.URL+"/api/plan/remove", url.Values{
+		"plan_id":    {strconv.Itoa(plan.Plan.ID)},
+		"move_id":    {strconv.Itoa(plan.Plan.Moves[0].ID)},
+		"csrf_token": {token},
+	})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("the removal returned %d, want %d: %s", resp.StatusCode, http.StatusOK, body)
+	}
+
+	plan = getPlan(t, client, httpServer.URL)
+	if len(plan.Plan.Moves) != 0 {
+		t.Fatalf("the plan still has %+v", plan.Plan.Moves)
+	}
+	// The file is still where it was.
+	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
+		t.Fatalf("the file is gone: %v", err)
 	}
 }

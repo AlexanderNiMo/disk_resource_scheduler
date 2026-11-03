@@ -73,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/scan", s.handleScan)
 		r.Post("/plan/approve", s.handleApprove)
 		r.Post("/plan/reject", s.handleReject)
+		r.Post("/plan/remove", s.handleRemove)
 		r.Post("/plan/rollback", s.handleRollback)
 
 		r.Get("/api/plan", s.apiPlan)
@@ -80,6 +81,7 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/api/scan", s.handleScan)
 		r.Post("/api/plan/approve", s.handleApprove)
 		r.Post("/api/plan/reject", s.handleReject)
+		r.Post("/api/plan/remove", s.handleRemove)
 		r.Post("/api/plan/rollback", s.handleRollback)
 	})
 

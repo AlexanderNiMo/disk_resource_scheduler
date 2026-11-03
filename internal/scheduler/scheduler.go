@@ -67,6 +67,10 @@ var (
 	ErrNotScanned = errors.New("the folders have not been scanned yet")
 	// ErrNothingToApprove means the plan has no moves in it.
 	ErrNothingToApprove = errors.New("there is nothing to approve")
+	// ErrNoSuchMove means the plan has no move with that id.
+	ErrNoSuchMove = errors.New("there is no such move in the plan")
+	// ErrNotPending means the move has already been started.
+	ErrNotPending = errors.New("the move has already been started")
 )
 
 // Plan is what the daemon proposes to do.
@@ -379,6 +383,55 @@ func (s *Scheduler) Reject(planID int) error {
 	s.mu.Unlock()
 
 	s.appendHistory(plan, "plan", StateIdle, time.Now())
+	return s.save()
+}
+
+// Remove takes one file out of the plan.
+//
+// The file stays where it is: it is not moved, and the plan is approved
+// without it.
+func (s *Scheduler) Remove(planID, moveID int) error {
+	s.mu.Lock()
+	if s.plan == nil {
+		s.mu.Unlock()
+		return ErrNoPlan
+	}
+	if s.plan.ID != planID {
+		s.mu.Unlock()
+		return ErrStalePlan
+	}
+	if s.st == StateRunning || s.st == StateRollingBack {
+		// The executor walks the moves of the plan: taking one out from
+		// under it would move the wrong file.
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	index := -1
+	for i := range s.plan.Moves {
+		if s.plan.Moves[i].ID == moveID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		s.mu.Unlock()
+		return ErrNoSuchMove
+	}
+	if s.plan.Moves[index].Status != StatusPending {
+		// The move has already been started: the file is not where the plan
+		// says it is.
+		s.mu.Unlock()
+		return ErrNotPending
+	}
+	s.plan.Moves = append(s.plan.Moves[:index], s.plan.Moves[index+1:]...)
+	if len(s.plan.Moves) == 0 {
+		// There is nothing to approve any more, and a plan that waits for an
+		// approval stops the next scan.
+		s.st = StateIdle
+	}
+	s.mu.Unlock()
+
+	s.log.Info("the file is taken out of the plan", "plan_id", planID, "move_id", moveID)
 	return s.save()
 }
 

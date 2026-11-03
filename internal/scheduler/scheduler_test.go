@@ -467,6 +467,116 @@ func TestRejectDiscardsThePlan(t *testing.T) {
 	}
 }
 
+func TestRemoveTakesAFileOutOfThePlan(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "one.mkv"), []byte("one"), 0o644)
+	os.WriteFile(filepath.Join(src, "two.mkv"), []byte("two"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	sch := newTestScheduler(t, cfg, probe)
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if len(plan.Moves) != 2 {
+		t.Fatalf("the plan has %d moves, want 2: %+v", len(plan.Moves), plan.Moves)
+	}
+
+	if err := sch.Remove(plan.ID, 999); err != ErrNoSuchMove {
+		t.Fatalf("the removal of an unknown move returned %v, want %v", err, ErrNoSuchMove)
+	}
+
+	// The files are the same size, so the plan takes them by name.
+	if err := sch.Remove(plan.ID, plan.Moves[0].ID); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	state, plan := sch.Snapshot()
+	if len(plan.Moves) != 1 || plan.Moves[0].Name != "two.mkv" {
+		t.Fatalf("the plan is %+v, want only the second file", plan.Moves)
+	}
+	if state != StatePending {
+		t.Fatalf("the state is %s, want %s", state, StatePending)
+	}
+
+	// The plan is approved without the file that was taken out of it.
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	waitFor(t, "the move to finish", func() bool {
+		state, _ := sch.Snapshot()
+		return state == StateDone
+	})
+
+	if _, err := os.Stat(filepath.Join(src, "two.mkv")); err == nil {
+		t.Fatal("the file that was left in the plan was not moved")
+	}
+	if _, err := os.Stat(filepath.Join(dst, "two.mkv")); err != nil {
+		t.Fatalf("the file is not at the destination: %v", err)
+	}
+	// The file that was taken out of the plan stayed where it was.
+	if _, err := os.Stat(filepath.Join(src, "one.mkv")); err != nil {
+		t.Fatalf("the file that was taken out of the plan is gone: %v", err)
+	}
+}
+
+func TestRemoveTakesTheLastFileOutOfThePlan(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "one.mkv"), []byte("one"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	sch := newTestScheduler(t, cfg, probe)
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if err := sch.Remove(plan.ID, plan.Moves[0].ID); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	// There is nothing to approve any more, so the daemon has to be free to
+	// scan again.
+	state, plan := sch.Snapshot()
+	if state != StateIdle {
+		t.Fatalf("the state is %s, want %s", state, StateIdle)
+	}
+	if len(plan.Moves) != 0 {
+		t.Fatalf("the plan has %d moves, want none", len(plan.Moves))
+	}
+	if err := sch.Approve(plan.ID); err != ErrNothingToApprove {
+		t.Fatalf("approve returned %v, want %v", err, ErrNothingToApprove)
+	}
+}
+
 func TestRollbackPutsOneMoveBack(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")

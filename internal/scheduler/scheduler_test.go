@@ -87,7 +87,7 @@ func TestBuildPlanPicksTheFreestDestination(t *testing.T) {
 	}
 }
 
-func TestBuildPlanSkipsUnmovableEntries(t *testing.T) {
+func TestBuildPlanSkipsTheEntriesThatCannotBeMoved(t *testing.T) {
 	cfg, m := fixture(
 		[]config.Folder{
 			folder("/src", config.DirTypeSrc, 2, 50*gb),
@@ -105,9 +105,6 @@ func TestBuildPlanSkipsUnmovableEntries(t *testing.T) {
 	plan := buildPlan(cfg, m, time.Now(), 1)
 	if len(plan.Moves) != 0 {
 		t.Fatalf("got %d moves, want none: %+v", len(plan.Moves), plan.Moves)
-	}
-	if len(plan.Unmovable) != 1 {
-		t.Fatalf("got %d unmovable entries, want 1", len(plan.Unmovable))
 	}
 }
 
@@ -257,9 +254,6 @@ func TestBuildPlanSkipsRecentlyChangedEntries(t *testing.T) {
 	plan := buildPlan(cfg, m, time.Now(), 1)
 	if len(plan.Moves) != 1 || plan.Moves[0].Name != "old" {
 		t.Fatalf("got %+v, want only the entry that has not changed for a day", plan.Moves)
-	}
-	if len(plan.Unmovable) != 1 || plan.Unmovable[0].Name != "fresh" {
-		t.Fatalf("got %+v, want the fresh entry to be reported as unmovable", plan.Unmovable)
 	}
 }
 

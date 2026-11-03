@@ -73,7 +73,6 @@ type Plan struct {
 	CreatedAt time.Time      `json:"created_at"`
 	Folders   []FolderStatus `json:"folders"`
 	Moves     []Move         `json:"moves"`
-	Unmovable []Unmovable    `json:"unmovable"`
 }
 
 // FolderStatus is what the scan found on one configured folder.
@@ -102,15 +101,6 @@ type Move struct {
 	Attempt int    `json:"attempt"`
 	Copied  int64  `json:"copied"`
 	Error   string `json:"error,omitempty"`
-}
-
-// Unmovable is an entry that stays where it is, and why.
-type Unmovable struct {
-	Src    string `json:"src"`
-	Name   string `json:"name"`
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
-	Reason string `json:"reason"`
 }
 
 // ScanStatus is what the scan is doing right now.
@@ -271,12 +261,6 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 		s.log.Debug("the entry is planned to move",
 			"name", move.Name, "from", move.Src, "to", move.Dst, "size", format.Bytes(move.Size))
 	}
-	for _, entry := range plan.Unmovable {
-		s.log.Debug("the entry stays where it is",
-			"name", entry.Name, "folder", entry.Src, "size", format.Bytes(entry.Size),
-			"reason", entry.Reason)
-	}
-
 	if len(plan.Moves) == 0 {
 		// There is nothing to approve, so the plan is not worth keeping:
 		// the state file holds the last plan that had something in it.
@@ -285,7 +269,7 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 		return nil
 	}
 	s.log.Info("the plan is ready",
-		"plan_id", plan.ID, "moves", len(plan.Moves), "unmovable", len(plan.Unmovable),
+		"plan_id", plan.ID, "moves", len(plan.Moves),
 		"duration", time.Since(started).Round(time.Millisecond).String())
 	return s.save()
 }
@@ -434,7 +418,6 @@ func copyPlan(plan *Plan) *Plan {
 	copied := *plan
 	copied.Folders = append([]FolderStatus(nil), plan.Folders...)
 	copied.Moves = append([]Move(nil), plan.Moves...)
-	copied.Unmovable = append([]Unmovable(nil), plan.Unmovable...)
 	return &copied
 }
 

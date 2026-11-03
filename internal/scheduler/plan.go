@@ -3,14 +3,12 @@
 package scheduler
 
 import (
-	"fmt"
 	"os"
 	"sort"
 	"time"
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
 	"github.com/alex/disk_resource_scheduler/internal/disk"
-	"github.com/alex/disk_resource_scheduler/internal/format"
 )
 
 // measured is what a scan found on the disks.
@@ -87,26 +85,17 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 				break
 			}
 			if entry.ModTime.After(now.Add(-minAge)) {
-				plan.Unmovable = append(plan.Unmovable, Unmovable{
-					Src: folder.Path, Name: entry.Name, Path: entry.Path, Size: entry.Size,
-					Reason: fmt.Sprintf("изменён меньше %s назад", format.Duration(minAge)),
-				})
+				// It was changed too recently: it is left alone.
 				continue
 			}
 
 			dst, dstVolume, ok := pickDestination(folders, m, free, entry, folder.Type, volume.Dev)
 			if !ok {
-				plan.Unmovable = append(plan.Unmovable, Unmovable{
-					Src: folder.Path, Name: entry.Name, Path: entry.Path, Size: entry.Size,
-					Reason: "нет папки-приёмника с таким type и достаточным местом",
-				})
+				// There is nowhere for it to go: it stays where it is.
 				continue
 			}
 			if _, err := os.Lstat(dst.Path + "/" + entry.Name); err == nil {
-				plan.Unmovable = append(plan.Unmovable, Unmovable{
-					Src: folder.Path, Name: entry.Name, Path: entry.Path, Size: entry.Size,
-					Reason: "в приёмнике уже есть такой файл",
-				})
+				// The destination has a file of that name already.
 				continue
 			}
 

@@ -57,7 +57,6 @@ type planView struct {
 	PlanID      int
 	StateText   string
 	Rows        []moveRow
-	Unmovable   []unmovableRow
 	CanApprove  bool
 	CanReject   bool
 	CanRollback bool
@@ -73,13 +72,6 @@ type moveRow struct {
 	Attempt     int
 	Error       string
 	CanRollback bool
-}
-
-type unmovableRow struct {
-	Name   string
-	Size   string
-	Src    string
-	Reason string
 }
 
 type historyRow struct {
@@ -150,14 +142,6 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 				// nothing else is running.
 				CanRollback: move.Status == scheduler.StatusDone &&
 					(state == scheduler.StateDone || state == scheduler.StateFailed),
-			})
-		}
-		for _, entry := range plan.Unmovable {
-			result.Plan.Unmovable = append(result.Plan.Unmovable, unmovableRow{
-				Name:   entry.Name,
-				Size:   format.Bytes(entry.Size),
-				Src:    entry.Src,
-				Reason: entry.Reason,
 			})
 		}
 	} else {

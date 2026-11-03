@@ -63,25 +63,6 @@
     </table>
     {{end}}
 
-    {{if .Plan.Unmovable}}
-    <h3>Не переносится</h3>
-    <table>
-      <thead>
-        <tr><th>Что</th><th>Размер</th><th>Откуда</th><th>Причина</th></tr>
-      </thead>
-      <tbody>
-      {{range .Plan.Unmovable}}
-        <tr>
-          <td>{{.Name}}</td>
-          <td>{{.Size}}</td>
-          <td><code>{{.Src}}</code></td>
-          <td>{{.Reason}}</td>
-        </tr>
-      {{end}}
-      </tbody>
-    </table>
-    {{end}}
-
   {{else}}
     <p>
       {{if .Scan.Scanned}}{{.Plan.StateText}}{{else}}Сканирование ещё не выполнялось: состояние папок неизвестно, плана нет.{{end}}

@@ -130,9 +130,15 @@ func TestABrokenStateFileDoesNotStopTheDaemon(t *testing.T) {
 	}
 	defer sch.Stop(context.Background())
 
-	state, plan := sch.Snapshot()
-	if plan != nil || state != StateIdle {
-		t.Fatalf("the state is %s %+v, want an empty state", state, plan)
+	// The broken file is not read, so nothing is resumed; the daemon scans
+	// on its own and carries on.
+	waitFor(t, "the first scan to finish", func() bool {
+		status := sch.ScanStatus()
+		return status.Scanned && !status.Running
+	})
+	state, _ := sch.Snapshot()
+	if state == StateRunning {
+		t.Fatal("a broken state file left the daemon running something")
 	}
 }
 

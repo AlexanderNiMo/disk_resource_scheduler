@@ -26,7 +26,7 @@ func TestListEntries(t *testing.T) {
 		t.Fatalf("make a symlink: %v", err)
 	}
 
-	entries, err := ListEntries(dir)
+	entries, err := ListEntries(dir, nil)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestListEntriesTakesTheNewestTimeInTheTree(t *testing.T) {
 		t.Fatalf("set the directory time: %v", err)
 	}
 
-	entries, err := ListEntries(dir)
+	entries, err := ListEntries(dir, nil)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}

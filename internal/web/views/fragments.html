@@ -2,6 +2,13 @@
 <section>
   <h2>План перемещения</h2>
 
+  {{if .Scan.Running}}
+    <p>
+      Сканирование идёт: <code>{{.Scan.Folder}}</code>,
+      записей: {{.Scan.Entries}}, папок: {{.Scan.Measured}} из {{.Scan.Total}}.
+    </p>
+  {{end}}
+
   {{if .Plan.HasPlan}}
     <p>План #{{.Plan.PlanID}} — {{.Plan.StateText}}</p>
 
@@ -76,7 +83,9 @@
     {{end}}
 
   {{else}}
-    <p>{{.Plan.StateText}}</p>
+    <p>
+      {{if .Scan.Scanned}}{{.Plan.StateText}}{{else}}Сканирование ещё не выполнялось: состояние папок неизвестно, плана нет.{{end}}
+    </p>
   {{end}}
 </section>
 {{end}}

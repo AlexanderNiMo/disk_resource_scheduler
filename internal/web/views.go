@@ -27,6 +27,18 @@ type view struct {
 	Folders []folderRow
 	Plan    planView
 	History []historyRow
+	Scan    scanView
+}
+
+// scanView is what the scan is doing right now.
+type scanView struct {
+	Running  bool
+	Scanned  bool
+	Folder   string
+	Entries  int
+	Measured int
+	Total    int
+	Started  string
 }
 
 type folderRow struct {
@@ -91,6 +103,17 @@ func (s *Server) buildView(r *http.Request) view {
 	state, plan := s.sch.Snapshot()
 	result.Plan.StateText = stateText(state)
 
+	scan := s.sch.ScanStatus()
+	result.Scan = scanView{
+		Running:  scan.Running,
+		Scanned:  scan.Scanned,
+		Folder:   scan.Folder,
+		Entries:  scan.Entries,
+		Measured: scan.Measured,
+		Total:    scan.Total,
+		Started:  scan.Started.Format("15:04:05"),
+	}
+
 	if plan != nil {
 		result.Plan.HasPlan = true
 		result.Plan.PlanID = plan.ID
@@ -138,12 +161,15 @@ func (s *Server) buildView(r *http.Request) view {
 			})
 		}
 	} else {
+		// The folders have not been measured yet, so their free space is
+		// unknown; saying so is better than showing nothing.
 		for _, folder := range s.cfg.Load().Sorted() {
 			result.Folders = append(result.Folders, folderRow{
 				Path:    folder.Path,
 				Role:    roleText(string(folder.DirType)),
 				Type:    folder.Type,
 				MinFree: format.Bytes(int64(folder.MinFree)),
+				State:   "не измерено",
 			})
 		}
 	}

@@ -272,6 +272,11 @@ func newTestScheduler(t *testing.T, cfg *config.Config, probe disk.Probe) *Sched
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { sch.Stop(context.Background()) })
+	// The daemon scans as soon as it starts; the tests should not race it.
+	waitFor(t, "the first scan to finish", func() bool {
+		status := sch.ScanStatus()
+		return status.Scanned && !status.Running
+	})
 	return sch
 }
 
@@ -380,8 +385,26 @@ func TestApproveExecutesTheMoves(t *testing.T) {
 
 func TestApproveRefusesAStalePlan(t *testing.T) {
 	sch := newTestScheduler(t, &config.Config{}, fakeProbe{})
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
 	if err := sch.Approve(7); err != ErrStalePlan && err != ErrNoPlan {
 		t.Fatalf("approve returned %v, want a stale plan or no plan", err)
+	}
+}
+
+func TestThereIsNoPlanBeforeTheFirstScan(t *testing.T) {
+	// The scheduler is not started, so no scan has happened yet.
+	sch := New(config.NewStore(&config.Config{}), testLogger(), fakeProbe{},
+		NewStateStore(t.TempDir()), NewHistory(t.TempDir()))
+	if err := sch.Approve(1); err != ErrNotScanned {
+		t.Fatalf("approve returned %v, want %v", err, ErrNotScanned)
+	}
+	if err := sch.Reject(1); err != ErrNotScanned {
+		t.Fatalf("reject returned %v, want %v", err, ErrNotScanned)
+	}
+	if err := sch.Rollback(1, 0); err != ErrNotScanned {
+		t.Fatalf("rollback returned %v, want %v", err, ErrNotScanned)
 	}
 }
 

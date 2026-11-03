@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel a run that is superseded by a newer push to the same branch. Without
+# this, a burst of pushes queues a burst of identical runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.27"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # The module cache is the slowest part of a cold run.
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal ./e2e)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The race detector is on: the executor writes into the plan while the
+      # interface reads it, and the tests are fast enough to afford it.
+      - name: Test
+        run: go test ./... -count=1 -race -timeout 10m -covermode=atomic -coverprofile=coverage.out
+
+      - name: Coverage
+        run: go tool cover -func=coverage.out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error

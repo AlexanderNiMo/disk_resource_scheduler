@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
@@ -67,6 +68,10 @@ var (
 	ErrNotScanned = errors.New("the folders have not been scanned yet")
 	// ErrNothingToApprove means the plan has no moves in it.
 	ErrNothingToApprove = errors.New("there is nothing to approve")
+	// ErrScanRunning means a scan is already in flight.
+	ErrScanRunning = errors.New("a scan is already running")
+	// ErrStopping means the daemon is going away.
+	ErrStopping = errors.New("the daemon is stopping")
 )
 
 // Plan is what the daemon proposes to do.
@@ -151,10 +156,20 @@ type Scheduler struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
+	// stopping tells whether the daemon is shutting down. A task that is
+	// started after that is not started at all: Stop waits for the
+	// WaitGroup, and adding to it after that wait has begun is a misuse
+	// the runtime panics about.
+	stopping bool
+	// scanActive tells whether a scan is in flight. A second request
+	// while one is running is refused instead of queued: twenty clicks on
+	// "Scan" must not mean twenty walks of the library.
+	scanActive atomic.Bool
 }
 
 // New builds a scheduler.
 func New(cfg *config.Store, log *slog.Logger, probe disk.Probe, store *StateStore, history *History) *Scheduler {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		cfg:     cfg,
 		log:     log,
@@ -162,16 +177,25 @@ func New(cfg *config.Store, log *slog.Logger, probe disk.Probe, store *StateStor
 		store:   store,
 		history: history,
 		st:      StateIdle,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
 // Start restores the plan from the state file and resumes an interrupted
 // execution.
+//
+// The context it is given is the daemon's lifetime: everything the scheduler
+// starts in the background runs on it, so a stop cancels it.
 func (s *Scheduler) Start(ctx context.Context) error {
 	base, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
+	old := s.cancel
 	s.ctx, s.cancel = base, cancel
 	s.mu.Unlock()
+	if old != nil {
+		old()
+	}
 
 	// The leftovers of the copies that were cut in the middle are thrown
 	// away first: they are the daemon's own files, they are in the way and
@@ -198,7 +222,12 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	// until the first tick of the cron, and there is no plan to make before
 	// the folders are known. A restored plan is not replaced: the scan skips
 	// itself while a plan waits for an approval.
-	s.run(func() { s.Scan(base) })
+	//
+	// The scan runs on the daemon's own context, so a stop cancels it and
+	// the daemon waits for it.
+	if err := s.StartScan(); err != nil {
+		s.log.Error("the first scan could not be started", "error", err)
+	}
 	return nil
 }
 
@@ -229,10 +258,15 @@ func (s *Scheduler) cleanPartials(cfg *config.Config) {
 }
 
 // Stop cancels a running execution and waits for it.
+//
+// Nothing new is started after this: the tasks that are already running
+// are given the time to finish, and the daemon goes away when they are
+// done.
 func (s *Scheduler) Stop(ctx context.Context) error {
-	s.mu.RLock()
+	s.mu.Lock()
+	s.stopping = true
 	cancel := s.cancel
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -251,6 +285,10 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 }
 
 // Scan measures the folders and publishes a new plan.
+//
+// A scan that is cancelled publishes nothing: the folders that were not
+// measured would look like full disks, and a plan built from half the data
+// is worse than no plan at all.
 func (s *Scheduler) Scan(ctx context.Context) error {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
@@ -284,6 +322,14 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 
 	s.log.Info("the scan is started", "folders", len(cfg.Folders))
 	measured := s.gather(ctx, cfg)
+
+	if ctx.Err() != nil {
+		// The scan was cancelled: half the folders are measured and half
+		// are not. A plan made of that would move files the daemon did not
+		// mean to move, so nothing is published.
+		s.log.Info("the scan was cancelled, the measurement is thrown away")
+		return ctx.Err()
+	}
 
 	s.mu.Lock()
 	if s.epoch != epoch {
@@ -324,6 +370,35 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	return s.save()
 }
 
+// StartScan starts a scan in the background and returns at once.
+//
+// The scan runs on the daemon's own context: it is cancelled when the
+// daemon stops, and the daemon waits for it before it goes away.
+//
+// Only one scan runs at a time. A second request while a scan is in
+// flight is refused, so that twenty clicks on the button do not mean
+// twenty walks of the library.
+func (s *Scheduler) StartScan() error {
+	if !s.scanActive.CompareAndSwap(false, true) {
+		return ErrScanRunning
+	}
+
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+
+	if !s.run(func() {
+		defer s.scanActive.Store(false)
+		if err := s.Scan(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			s.log.Error("the scan failed", "error", err)
+		}
+	}) {
+		s.scanActive.Store(false)
+		return ErrStopping
+	}
+	return nil
+}
+
 // Approve starts the execution of the current plan.
 func (s *Scheduler) Approve(planID int) error {
 	s.mu.Lock()
@@ -348,12 +423,16 @@ func (s *Scheduler) Approve(planID int) error {
 		return ErrBusy
 	}
 	plan := s.plan
+	if !s.reserveLocked() {
+		s.mu.Unlock()
+		return ErrStopping
+	}
 	s.st = StateRunning
 	s.epoch++
 	s.mu.Unlock()
 
 	s.save()
-	s.run(func() { s.execute(plan, false) })
+	s.start(func() { s.execute(plan, false) })
 	return nil
 }
 
@@ -429,12 +508,16 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 
 	isCurrent := current != nil && current.ID == planID
 	s.mu.Lock()
+	if !s.reserveLocked() {
+		s.mu.Unlock()
+		return ErrStopping
+	}
 	s.st = StateRollingBack
 	s.epoch++
 	s.mu.Unlock()
 
 	s.save()
-	s.run(func() { s.rollback(plan, targets, isCurrent, previous) })
+	s.start(func() { s.rollback(plan, targets, isCurrent, previous) })
 	return nil
 }
 
@@ -753,8 +836,39 @@ func (s *Scheduler) finish(plan *Plan, kind string) {
 	s.appendHistory(plan, kind, st, time.Now())
 }
 
-func (s *Scheduler) run(fn func()) {
+// run starts a task in the background and waits for it when the daemon
+// stops.
+//
+// A task that is started after the shutdown has begun is not started at
+// all: the WaitGroup is waited for by Stop, and adding to it after that
+// wait has begun is a misuse the runtime panics about.
+func (s *Scheduler) run(fn func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.reserveLocked() {
+		return false
+	}
+	s.start(fn)
+	return true
+}
+
+// reserveLocked takes a slot in the WaitGroup for a task that is about to
+// start. It returns false when the daemon is stopping.
+//
+// The slot is taken while the lock is held, so that it can never be taken
+// after Stop has begun to wait: the runtime panics about that.
+//
+// The caller must hold s.mu.
+func (s *Scheduler) reserveLocked() bool {
+	if s.stopping {
+		return false
+	}
 	s.wg.Add(1)
+	return true
+}
+
+// start runs a task in a slot that was reserved with reserveLocked.
+func (s *Scheduler) start(fn func()) {
 	go func() {
 		defer s.wg.Done()
 		fn()

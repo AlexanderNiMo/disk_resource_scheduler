@@ -258,6 +258,36 @@ func TestBuildPlanSkipsRecentlyChangedEntries(t *testing.T) {
 	}
 }
 
+// A symlink is not media: moving it frees no space, and its target would
+// break on another disk.
+func TestBuildPlanSkipsSymlinks(t *testing.T) {
+	cfg, m := fixture(
+		[]config.Folder{
+			folder("/src", config.DirTypeSrc, 2, 50*gb),
+			folder("/dst", config.DirTypeDst, 2, 0),
+		},
+		map[string]disk.Volume{
+			"/src": {Dev: 1, Free: 10 * gb},
+			"/dst": {Dev: 2, Free: 500 * gb},
+		},
+		map[string][]disk.Entry{
+			"/src": {
+				{Name: "link.mkv", Path: "/src/link.mkv", Size: 12, IsSymlink: true},
+				{Name: "movie.mkv", Path: "/src/movie.mkv", Size: 20 * gb},
+			},
+		},
+	)
+
+	plan := buildPlan(cfg, m, time.Now(), 1)
+	if len(plan.Moves) != 1 || plan.Moves[0].Name != "movie.mkv" {
+		t.Fatalf("got %+v, want only the file", plan.Moves)
+	}
+	// The size of the symlink is not counted as freed space either.
+	if plan.Moves[0].Size != 20*gb {
+		t.Fatalf("the move is %d bytes, want %d", plan.Moves[0].Size, 20*gb)
+	}
+}
+
 // newTestScheduler builds a scheduler over a temporary state directory.
 func newTestScheduler(t *testing.T, cfg *config.Config, probe disk.Probe) *Scheduler {
 	t.Helper()
@@ -745,5 +775,164 @@ func TestTheLeftoversOfACopyAreRemovedAtTheStart(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(src, "somebody-elses.mkv")); err != nil {
 		t.Fatalf("a file that is not the daemon's was removed: %v", err)
+	}
+}
+
+// slowProbe measures the volumes slowly, so that a test can stop the daemon
+// while a scan is walking.
+type slowVolumeProbe struct {
+	delay   time.Duration
+	volumes map[string]disk.Volume
+}
+
+func (p slowVolumeProbe) VolumeOf(path string) (disk.Volume, error) {
+	time.Sleep(p.delay)
+	volume, ok := p.volumes[path]
+	if !ok {
+		return disk.Volume{}, os.ErrNotExist
+	}
+	return volume, nil
+}
+
+// A scan that is cancelled publishes nothing: the folders it did not reach
+// would look like full disks.
+func TestACancelledScanPublishesNoPlan(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "a-src")
+	dst := filepath.Join(dir, "b-dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := slowVolumeProbe{delay: 300 * time.Millisecond, volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), NewHistory(dir))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	if err := sch.Scan(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("the scan returned %v, want %v", err, context.Canceled)
+	}
+	state, plan := sch.Snapshot()
+	if state == StatePending && plan != nil && len(plan.Moves) > 0 {
+		t.Fatalf("the cancelled scan published a plan: %+v", plan.Moves)
+	}
+}
+
+// The daemon waits for the scan it started, and the scan is cancelled.
+func TestTheStopWaitsForTheScan(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := slowVolumeProbe{delay: 300 * time.Millisecond, volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), NewHistory(dir))
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitFor(t, "the scan to start", func() bool { return sch.ScanStatus().Running })
+
+	if err := sch.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if sch.ScanStatus().Running {
+		t.Fatal("the scan was still running after the stop")
+	}
+}
+
+// A second scan is refused while one is running: the library is walked once,
+// not once per click.
+func TestASecondScanIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := slowVolumeProbe{delay: 300 * time.Millisecond, volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), NewHistory(dir))
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+	waitFor(t, "the scan to start", func() bool { return sch.ScanStatus().Running })
+
+	if err := sch.StartScan(); !errors.Is(err, ErrScanRunning) {
+		t.Fatalf("the second scan returned %v, want %v", err, ErrScanRunning)
+	}
+}
+
+// A stop and an approval at the same time must not upset the runtime.
+func TestTheStopAndTheApprovalDoNotCollide(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src")
+		dst := filepath.Join(dir, "dst")
+		os.MkdirAll(src, 0o755)
+		os.MkdirAll(dst, 0o755)
+		os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+		cfg := &config.Config{
+			Folders: map[string]config.Folder{
+				src: folder(src, config.DirTypeSrc, 2, 50*gb),
+				dst: folder(dst, config.DirTypeDst, 2, 0),
+			},
+			Scan: config.Scan{MinAge: config.Duration(0)},
+		}
+		probe := fakeProbe{volumes: map[string]disk.Volume{
+			src: {Dev: 1, Free: 1 * gb},
+			dst: {Dev: 2, Free: 500 * gb},
+		}}
+		sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), NewHistory(dir))
+		if err := sch.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		waitFor(t, "the scan", func() bool { return sch.ScanStatus().Scanned })
+		_, plan := sch.Snapshot()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); sch.Stop(context.Background()) }()
+		go func() { defer wg.Done(); sch.Approve(plan.ID) }()
+		wg.Wait()
 	}
 }

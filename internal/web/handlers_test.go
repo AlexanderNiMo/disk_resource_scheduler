@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -351,6 +352,78 @@ func TestTheManualScanMeasuresEveryFolder(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("the scan never finished")
+}
+
+// A scan that is already running is not started again: the library would be
+// walked twice for nothing.
+func TestASecondScanIsRefused(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "src")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "movie.mkv"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+		Folders: map[string]config.Folder{
+			dir: {Path: dir, DirType: config.DirTypeSrc, Type: 2, MinFree: 1},
+		},
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	// The probe is slow, so the scan stays in flight.
+	sch := scheduler.New(store, logger, slowProbe{}, scheduler.NewStateStore(t.TempDir()), history)
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	client := login(t, httpServer)
+	page, _ := url.Parse(httpServer.URL)
+	token := ""
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			token = cookie.Value
+		}
+	}
+
+	// Wait for the first scan to be under way.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !sch.ScanStatus().Running {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sch.ScanStatus().Running {
+		t.Fatal("the first scan never started")
+	}
+
+	resp, err := client.PostForm(httpServer.URL+"/api/scan", url.Values{"csrf_token": {token}})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("the second scan returned %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+}
+
+// slowProbe measures the volumes slowly, so that a scan stays in flight.
+type slowProbe struct{}
+
+func (slowProbe) VolumeOf(string) (disk.Volume, error) {
+	time.Sleep(200 * time.Millisecond)
+	return disk.Volume{Dev: 1, Free: 1 << 30}, nil
 }
 
 func TestASessionOfARemovedUserStopsWorking(t *testing.T) {

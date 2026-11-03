@@ -137,11 +137,17 @@ func (a *App) Stop(ctx context.Context) error {
 		a.cancel()
 	}
 	a.mu.Lock()
-	if a.cron != nil {
-		a.cron.Stop()
-		a.cron = nil
-	}
+	cronStopped := a.cron.Stop()
+	a.cron = nil
 	a.mu.Unlock()
+
+	// The cron job may be in the middle of a scan. Its context is done when
+	// the job returns, and the job waits for the scan it started.
+	select {
+	case <-cronStopped.Done():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	if a.http != nil {
 		shutdownCtx, cancel := context.WithTimeout(ctx, httpShutdownTimeout)
@@ -166,7 +172,7 @@ func (a *App) Addr() string {
 func (a *App) startCron(expr string) error {
 	c := cron.New()
 	if _, err := c.AddFunc(expr, func() {
-		if err := a.sched.Scan(context.Background()); err != nil {
+		if err := a.sched.StartScan(); err != nil && !errors.Is(err, scheduler.ErrScanRunning) {
 			a.log.Error("the scan failed", "error", err)
 		}
 	}); err != nil {
@@ -199,7 +205,7 @@ func (a *App) watchConfig(ctx context.Context) {
 				continue
 			}
 			stamp = current
-			a.reload()
+			a.reload(ctx)
 		}
 	}
 }
@@ -217,7 +223,7 @@ func (a *App) configStamp() string {
 //
 // A config that does not parse leaves the running one alone: a broken file
 // must not take the daemon down.
-func (a *App) reload() {
+func (a *App) reload(ctx context.Context) {
 	cfg, err := config.Load(a.cfgPath)
 	if err != nil {
 		a.log.Warn("the config is not usable, keeping the old one", "error", err)
@@ -242,11 +248,21 @@ func (a *App) reload() {
 		return
 	}
 	a.mu.Lock()
+	var oldCron context.Context
 	if a.cron != nil {
-		a.cron.Stop()
+		oldCron = a.cron.Stop()
 		a.cron = nil
 	}
 	a.mu.Unlock()
+	// The old cron may be in the middle of a scan. The new one waits for it,
+	// so that two scans do not walk the library at the same time.
+	if oldCron != nil {
+		select {
+		case <-oldCron.Done():
+		case <-ctx.Done():
+			return
+		}
+	}
 	if err := a.startCron(cfg.Scan.Schedule); err != nil {
 		a.log.Warn("the new schedule is not usable, keeping the old one", "error", err)
 	}

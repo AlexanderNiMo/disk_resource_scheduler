@@ -1,7 +1,6 @@
 package web
 
 import (
-	"context"
 	"net/http"
 	"strings"
 )
@@ -69,15 +68,14 @@ func (s *Server) handlePlanFragment(w http.ResponseWriter, r *http.Request) {
 //
 // The scan walks the library, which takes a while, so it runs in the
 // background: the page shows the plan as soon as it is ready.
+//
+// A scan that is already running is not started again: the library would
+// be walked twice for nothing.
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
-	go func() {
-		// The context of the request is cancelled when the request ends,
-		// and the scan would stop at the first folder. It runs on the
-		// context of the daemon instead.
-		if err := s.sch.Scan(context.Background()); err != nil {
-			s.log.Error("the scan failed", "error", err)
-		}
-	}()
+	if err := s.sch.StartScan(); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	s.answer(w, r, http.StatusAccepted, map[string]string{"status": "scanning"})
 }
 

@@ -85,6 +85,12 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 			if freed >= deficit {
 				break
 			}
+			if entry.IsSymlink {
+				// A symlink frees nothing: it is the target that takes the
+				// space, and the target stays where it is. Moving the link
+				// itself would also break a relative target.
+				continue
+			}
 			if entry.ModTime.After(now.Add(-minAge)) {
 				// It was changed too recently: it is left alone.
 				continue

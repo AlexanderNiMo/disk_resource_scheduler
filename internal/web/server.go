@@ -30,6 +30,10 @@ type session struct {
 	// changed password ends the sessions of that user.
 	hash    string
 	expires time.Time
+	// fragment is the hash of the last fragment sent to this browser.
+	// The plan block is polled every few seconds, and a poll that throws
+	// the buttons away makes a click on them do nothing.
+	fragment string
 }
 
 // New builds the web interface.

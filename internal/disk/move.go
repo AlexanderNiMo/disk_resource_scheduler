@@ -192,7 +192,9 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(out, &countingReader{reader: in, counter: c})
+	// io.Copy returns how many bytes it copied.
+	written, err := io.Copy(out, in)
+	c.add(written)
 	// The data must reach the disk before the file is closed: the source is
 	// removed after the copy, and a power cut in between must not leave a
 	// file that is there but empty.
@@ -212,18 +214,6 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 	}
 	restoreTimes(src, dst)
 	return nil
-}
-
-// countingReader counts the bytes that go through it.
-type countingReader struct {
-	reader  io.Reader
-	counter *copier
-}
-
-func (r *countingReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	r.counter.add(int64(n))
-	return n, err
 }
 
 // restoreTimes copies the modification time of src onto dst.

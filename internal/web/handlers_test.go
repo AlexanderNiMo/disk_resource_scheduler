@@ -389,6 +389,46 @@ func TestTheManualScanMeasuresEveryFolder(t *testing.T) {
 	t.Fatal("the scan never finished")
 }
 
+// The plan block is polled every few seconds. A poll that throws the
+// buttons away makes a click on them do nothing, so the fragment is only
+// sent when it really changed.
+func TestThePlanFragmentIsOnlySentWhenItChanged(t *testing.T) {
+	server, srv, _ := newTestServerWith(t)
+	client := login(t, server)
+
+	resp, err := client.Get(server.URL + "/fragments/plan")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the first fragment returned %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(string(body), "План перемещения") {
+		t.Fatalf("the fragment is %s, want the plan block", body)
+	}
+
+	// Nothing changed, so the browser keeps what it has.
+	resp, err = client.Get(server.URL + "/fragments/plan")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("the second fragment returned %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// The daemon is told what it sent last, per browser.
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for token, session := range srv.tokens {
+		if session.fragment == "" {
+			t.Fatalf("the session of %q remembers no fragment", token)
+		}
+	}
+}
+
 // A scan that is already running is not started again: the library would be
 // walked twice for nothing.
 func TestASecondScanIsRefused(t *testing.T) {

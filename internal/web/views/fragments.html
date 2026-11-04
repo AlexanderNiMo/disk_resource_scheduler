@@ -45,6 +45,7 @@
           <td><code>{{.Dst}}</code></td>
           <td>
             {{.Status}}{{if .Attempt}} (попытка {{.Attempt}}){{end}}
+            {{if .Copied}}<br><small>скопировано {{.Copied}}</small>{{end}}
             {{if .Error}}<br><small>{{.Error}}</small>{{end}}
           </td>
           <td>

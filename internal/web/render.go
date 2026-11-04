@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -81,19 +82,25 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 
 // renderFragment writes a piece of a page, with no layout.
 func (s *Server) renderFragment(w http.ResponseWriter, r *http.Request, name string, data any) {
-	tmpl, ok := s.tmpl.set["dashboard"]
-	if !ok {
+	body, err := s.fragmentBytes(name, data)
+	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
+}
 
+// fragmentBytes renders a piece of a page and returns it.
+func (s *Server) fragmentBytes(name string, data any) ([]byte, error) {
+	tmpl, ok := s.tmpl.set["dashboard"]
+	if !ok {
+		return nil, errors.New("the dashboard template is missing")
+	}
 	var buf bytes.Buffer
 	if err := tmpl.ExecuteTemplate(&buf, name, data); err != nil {
 		s.log.Error("rendering a fragment failed", "fragment", name, "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		return nil, err
 	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = buf.WriteTo(w)
+	return buf.Bytes(), nil
 }

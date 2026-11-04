@@ -870,7 +870,13 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, okStatus st
 		}
 		s.log.Warn("the move failed", "from", from, "to", to, "attempt", attempt, "error", err)
 		if attempt < moveAttempts {
-			time.Sleep(retryPause)
+			// The pause ends right away when the daemon is stopping: there
+			// is no point in trying again when nobody is waiting.
+			select {
+			case <-time.After(retryPause):
+			case <-s.daemonCtx().Done():
+				return
+			}
 		}
 	}
 	s.setMove(plan, index, StatusFailed, lastErr.Error())
@@ -1003,10 +1009,18 @@ func (s *Scheduler) start(fn func()) {
 
 // stopped reports whether the daemon is shutting down.
 func (s *Scheduler) stopped() bool {
+	return s.daemonCtx().Err() != nil
+}
+
+// daemonCtx returns the context of the daemon's lifetime.
+func (s *Scheduler) daemonCtx() context.Context {
 	s.mu.RLock()
 	ctx := s.ctx
 	s.mu.RUnlock()
-	return ctx != nil && ctx.Err() != nil
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (s *Scheduler) setMove(plan *Plan, index int, status, message string) {

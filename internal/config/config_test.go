@@ -206,17 +206,3 @@ web:
 		})
 	}
 }
-
-func TestRedacted(t *testing.T) {
-	cfg, err := Load(writeConfig(t, validConfig))
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	redacted := cfg.Redacted()
-	if redacted.Web.Users["alex"] != "***" {
-		t.Fatalf("the password is not masked: %q", redacted.Web.Users["alex"])
-	}
-	if cfg.Web.Users["alex"] != "secret" {
-		t.Fatal("the original config was changed")
-	}
-}

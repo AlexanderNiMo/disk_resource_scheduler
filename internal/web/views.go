@@ -67,6 +67,7 @@ type moveRow struct {
 	ID          int
 	Name        string
 	Size        string
+	Copied      string
 	Src         string
 	Dst         string
 	Status      string
@@ -130,7 +131,7 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 			})
 		}
 		for _, move := range plan.Moves {
-			result.Plan.Rows = append(result.Plan.Rows, moveRow{
+			row := moveRow{
 				ID:      move.ID,
 				Name:    move.Name,
 				Size:    format.Bytes(move.Size),
@@ -139,11 +140,16 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 				Status:  moveStatusText(move.Status),
 				Attempt: move.Attempt,
 				Error:   move.Error,
-				// Only a finished move can be put back, and only while
-				// nothing else is running.
-				CanRollback: move.Status == scheduler.StatusDone &&
-					(state == scheduler.StateDone || state == scheduler.StateFailed),
-			})
+			}
+			if move.Status == scheduler.StatusMoving {
+				// The progress is only interesting while the copy runs.
+				row.Copied = format.Bytes(move.Copied)
+			}
+			// Only a finished move can be put back, and only while
+			// nothing else is running.
+			row.CanRollback = move.Status == scheduler.StatusDone &&
+				(state == scheduler.StateDone || state == scheduler.StateFailed)
+			result.Plan.Rows = append(result.Plan.Rows, row)
 		}
 	} else {
 		// The folders have not been measured yet, so their free space is

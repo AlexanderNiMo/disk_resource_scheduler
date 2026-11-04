@@ -124,16 +124,6 @@ func (c *Config) Sorted() []Folder {
 	return folders
 }
 
-// Redacted returns a copy with the passwords masked, for logging.
-func (c *Config) Redacted() Config {
-	redacted := *c
-	redacted.Web.Users = make(map[string]string, len(c.Web.Users))
-	for name := range c.Web.Users {
-		redacted.Web.Users[name] = "***"
-	}
-	return redacted
-}
-
 func (c *Config) validate() error {
 	if len(c.Folders) == 0 {
 		return fmt.Errorf("folders: want at least one folder, got none")

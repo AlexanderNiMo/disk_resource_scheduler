@@ -1,6 +1,8 @@
 package web
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -60,9 +62,52 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 // The history is not in the fragment, so it is not read: the file holds
 // every plan ever made, and reading it every few seconds would cost more
 // than the rest of the page.
+//
+// The fragment is only sent when it really changed. Every poll throws the
+// buttons away and makes them again, and a click that begins on the old
+// button and ends on the new one does nothing at all.
 func (s *Server) handlePlanFragment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	s.renderFragment(w, r, "plan_block", s.buildView(r, false))
+	body, err := s.fragmentBytes("plan_block", s.buildView(r, false))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !s.fragmentChanged(r, body) {
+		// Nothing changed: the browser keeps what it has.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+// fragmentChanged tells whether the fragment is different from the one this
+// browser was given last time, and remembers it.
+//
+// The plan block carries the csrf token, so the fragment is different for
+// every browser: the comparison is per browser and not for the daemon.
+func (s *Server) fragmentChanged(r *http.Request, body []byte) bool {
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	token, _ := r.Context().Value(ctxSession).(string)
+	if token == "" {
+		return true
+	}
+	found, ok := s.tokens[token]
+	if !ok {
+		return true
+	}
+	if found.fragment == digest {
+		return false
+	}
+	found.fragment = digest
+	s.tokens[token] = found
+	return true
 }
 
 // handleScan starts a scan.

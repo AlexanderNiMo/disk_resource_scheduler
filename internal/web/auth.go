@@ -21,7 +21,8 @@ const (
 )
 
 // sessionTTL is how long a session lives. It is a constant, not a knob: a
-// home server does not need a sliding expiration policy.
+// home server does not need a sliding expiration policy, and a session that
+// is used every day is not a session that is forgotten.
 const sessionTTL = 30 * 24 * time.Hour
 
 // maxFormMemory bounds the body of a state-changing request.
@@ -32,6 +33,7 @@ type ctxKey int
 const (
 	ctxUser ctxKey = iota
 	ctxCSRF
+	ctxSession
 )
 
 func randomToken() string {
@@ -71,6 +73,7 @@ func (s *Server) sessions(next http.Handler) http.Handler {
 			switch {
 			case ok && s.sessionValid(found):
 				ctx = context.WithValue(ctx, ctxUser, found.user)
+				ctx = context.WithValue(ctx, ctxSession, cookie.Value)
 			case ok:
 				// The user was taken out of the config, or the password was
 				// changed: the config is the list of the people who may
@@ -137,10 +140,18 @@ func (s *Server) csrfOK(r *http.Request) bool {
 func (s *Server) newSession(user string) string {
 	token := randomToken()
 	s.mu.Lock()
+	// The sessions that are over are thrown away: nothing else would ever
+	// take them out, and they are of no use to anybody.
+	now := time.Now()
+	for key, found := range s.tokens {
+		if now.After(found.expires) {
+			delete(s.tokens, key)
+		}
+	}
 	s.tokens[token] = session{
 		user:    user,
 		hash:    passwordHash(s.cfg.Load().Web.Users[user]),
-		expires: time.Now().Add(sessionTTL),
+		expires: now.Add(sessionTTL),
 	}
 	s.mu.Unlock()
 	return token
@@ -158,8 +169,8 @@ func (s *Server) sessionUser(token string) (session, bool) {
 		delete(s.tokens, token)
 		return session{}, false
 	}
-	found.expires = time.Now().Add(sessionTTL)
-	s.tokens[token] = found
+	// The expiry is not moved: a session lives for the time it was given
+	// and no longer. A stolen cookie is good for a month, not for ever.
 	return found, true
 }
 

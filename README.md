@@ -29,7 +29,7 @@ make build
 useradd --system --no-create-home --shell /usr/sbin/nologin diskd
 install -m 0755 bin/diskd /usr/local/bin/diskd
 install -d -m 0750 -o root -g diskd /etc/disk-resource-scheduler
-install -m 0600 -o root -g diskd config.yaml /etc/disk-resource-scheduler/config.yaml
+install -m 0640 -o root -g diskd config.yaml /etc/disk-resource-scheduler/config.yaml
 install -m 0644 deploy/disk-resource-scheduler.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now disk-resource-scheduler
@@ -106,6 +106,18 @@ POST /api/plan/rollback plan_id, move_id — откатить операцию (
   ждущий одобрения, не теряется, а прерванная операция повторяется с чистого
   приёмника.
 - `history.jsonl` — история планов, последние 50.
+
+Прерванный откат возобновляется после запуска: сохраняются выбранные
+операции, даже если откатывается план из истории. Старое состояние
+`rolling_back` без записи операций не возобновляется автоматически.
+
+Если после сбоя и источник, и приёмник существуют, демон сохраняет оба и
+показывает ошибку. Совпадение размера не доказывает, что копия верна:
+разобрать такой конфликт нужно вручную.
+
+Перенос требует поддержки атомарного переименования без замены существующего
+файла (Linux или macOS) и синхронизации каталогов файловой системой.
+При отсутствии поддержки операция завершается ошибкой, источник сохраняется.
 
 ## Разработка
 

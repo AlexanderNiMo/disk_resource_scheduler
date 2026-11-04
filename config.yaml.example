@@ -33,7 +33,7 @@ state:
   dir: "/var/lib/disk-resource-scheduler"
 
 # The users of the web interface. The password is stored as it is: the file
-# has to be readable by the daemon user only (0600, root:diskd).
+# has to be readable by the root and the daemon group (0640, root:diskd).
 web:
   users:
     alex: "change-me"

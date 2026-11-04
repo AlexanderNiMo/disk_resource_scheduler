@@ -80,17 +80,6 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	_, _ = buf.WriteTo(w)
 }
 
-// renderFragment writes a piece of a page, with no layout.
-func (s *Server) renderFragment(w http.ResponseWriter, r *http.Request, name string, data any) {
-	body, err := s.fragmentBytes(name, data)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(body)
-}
-
 // fragmentBytes renders a piece of a page and returns it.
 func (s *Server) fragmentBytes(name string, data any) ([]byte, error) {
 	tmpl, ok := s.tmpl.set["dashboard"]

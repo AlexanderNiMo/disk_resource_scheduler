@@ -64,6 +64,7 @@ type planView struct {
 }
 
 type moveRow struct {
+	CanRemove   bool
 	ID          int
 	Name        string
 	Size        string
@@ -132,14 +133,15 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 		}
 		for _, move := range plan.Moves {
 			row := moveRow{
-				ID:      move.ID,
-				Name:    move.Name,
-				Size:    format.Bytes(move.Size),
-				Src:     move.Src,
-				Dst:     move.Dst,
-				Status:  moveStatusText(move.Status),
-				Attempt: move.Attempt,
-				Error:   move.Error,
+				CanRemove: state == scheduler.StatePending,
+				ID:        move.ID,
+				Name:      move.Name,
+				Size:      format.Bytes(move.Size),
+				Src:       move.Src,
+				Dst:       move.Dst,
+				Status:    moveStatusText(move.Status),
+				Attempt:   move.Attempt,
+				Error:     move.Error,
 			}
 			if move.Status == scheduler.StatusMoving {
 				// The progress is only interesting while the copy runs.

@@ -1039,18 +1039,18 @@ func TestAScanIsThrownAwayWhenThePlanChangesUnderIt(t *testing.T) {
 		return state == StateDone
 	})
 
-	// A slow scan starts, and the plan is rejected while it runs: the
+	// A slow scan starts, and the plan is rolled back while it runs: the
 	// measurement it took is stale, and it must not be published.
 	probe.setDelay(200 * time.Millisecond)
 	go sch.Scan(context.Background())
 	time.Sleep(50 * time.Millisecond)
-	if err := sch.Reject(plan.ID); err != nil {
-		t.Fatalf("the reject: %v", err)
+	if err := sch.Rollback(plan.ID, 0); err != nil {
+		t.Fatalf("the rollback: %v", err)
 	}
 
 	waitFor(t, "the scan to finish", func() bool { return !sch.ScanStatus().Running })
 	_, after := sch.Snapshot()
-	if after != nil {
+	if after == nil || after.ID != plan.ID {
 		t.Fatalf("the stale scan published a plan: %+v", after)
 	}
 }
@@ -1298,5 +1298,137 @@ func TestTheRollbackAndTheApprovalDoNotCollide(t *testing.T) {
 		wg.Wait()
 		time.Sleep(20 * time.Millisecond)
 		sch.Stop(context.Background())
+	}
+}
+
+func TestRemoveExcludesOnlyTheSelectedMoveAndPersistsThePlan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keep")
+	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStateStore(t.TempDir())
+	s := &Scheduler{
+		st: StatePending, scan: ScanStatus{Scanned: true}, store: store,
+		plan: &Plan{ID: 7, Moves: []Move{
+			{ID: 1, Path: path, Status: StatusPending},
+			{ID: 2, Status: StatusPending},
+		}},
+	}
+	if err := s.Remove(7, 1); err != nil {
+		t.Fatal(err)
+	}
+	state, plan, err := store.Load()
+	if err != nil || state != StatePending || len(plan.Moves) != 1 || plan.Moves[0].ID != 2 {
+		t.Fatalf("persisted plan: state=%s plan=%+v err=%v", state, plan, err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "keep" {
+		t.Fatalf("excluded file changed: %q, %v", data, err)
+	}
+	if err := s.Remove(7, 2); err != nil {
+		t.Fatal(err)
+	}
+	state, plan, err = store.Load()
+	if err != nil || state != StateIdle || len(plan.Moves) != 0 {
+		t.Fatalf("empty plan: state=%s plan=%+v err=%v", state, plan, err)
+	}
+}
+
+func TestRemoveRefusesAnInvalidOrActivePlan(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		state          State
+		scanned        bool
+		planID, moveID int
+		want           error
+	}{
+		{"not scanned", StatePending, false, 7, 1, ErrNotScanned},
+		{"stale", StatePending, true, 6, 1, ErrStalePlan},
+		{"running", StateRunning, true, 7, 1, ErrBusy},
+		{"rolling back", StateRollingBack, true, 7, 1, ErrBusy},
+		{"done", StateDone, true, 7, 1, ErrStalePlan},
+		{"unknown move", StatePending, true, 7, 9, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Scheduler{st: tc.state, scan: ScanStatus{Scanned: tc.scanned}, plan: &Plan{ID: 7, Moves: []Move{{ID: 1}}}}
+			err := s.Remove(tc.planID, tc.moveID)
+			if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			if len(s.plan.Moves) != 1 || s.st != tc.state {
+				t.Fatal("refused removal changed the plan")
+			}
+		})
+	}
+}
+
+func TestRejectRefusesAnActiveOrSettledPlan(t *testing.T) {
+	for _, state := range []State{StateRunning, StateRollingBack, StateDone, StateFailed, StateIdle} {
+		t.Run(string(state), func(t *testing.T) {
+			s := &Scheduler{st: state, scan: ScanStatus{Scanned: true}, plan: &Plan{ID: 1}}
+			if err := s.Reject(1); err == nil {
+				t.Fatal("rejected a plan that was not pending")
+			}
+			if s.st != state || s.plan == nil {
+				t.Fatal("rejection changed the plan")
+			}
+		})
+	}
+}
+
+func TestOperationsDoNotStartWhenStateCannotBeSaved(t *testing.T) {
+	for _, rollback := range []bool{false, true} {
+		t.Run(fmt.Sprint(rollback), func(t *testing.T) {
+			dir := t.TempDir()
+			src, dst := filepath.Join(dir, "src"), filepath.Join(dir, "dst")
+			os.WriteFile(src, []byte("source"), 0o600)
+			os.WriteFile(dst, []byte("destination"), 0o600)
+			blocker := filepath.Join(dir, "not-a-directory")
+			os.WriteFile(blocker, nil, 0o600)
+			state, status := StatePending, StatusPending
+			if rollback {
+				state, status = StateDone, StatusDone
+			}
+			s := New(config.NewStore(&config.Config{}), testLogger(), nil, NewStateStore(blocker), NewHistory(dir))
+			s.st, s.scan.Scanned = state, true
+			s.plan = &Plan{ID: 1, Moves: []Move{{ID: 1, Path: src, DstPath: dst, Status: status}}}
+			var err error
+			if rollback {
+				err = s.Rollback(1, 1)
+			} else {
+				err = s.Approve(1)
+			}
+			if err == nil {
+				t.Fatal("operation started without durable state")
+			}
+			if s.st != state || s.activeRollback != nil {
+				t.Fatal("failed operation changed state")
+			}
+			if err := s.Stop(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for path, want := range map[string]string{src: "source", dst: "destination"} {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != want {
+					t.Fatalf("file changed: %q %v", data, err)
+				}
+			}
+		})
+	}
+}
+
+func TestChangedRecentlyChecksFilesInsideADirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "movie")
+	os.WriteFile(path, []byte("old"), 0o600)
+	old := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(dir, old, old)
+	os.Chtimes(path, old, old)
+	s := &Scheduler{cfg: config.NewStore(&config.Config{Scan: config.Scan{MinAge: config.Duration(24 * time.Hour)}})}
+	if s.changedRecently(dir) {
+		t.Fatal("old tree was refused")
+	}
+	os.WriteFile(path, []byte("new download"), 0o600)
+	if !s.changedRecently(dir) {
+		t.Fatal("active file inside old directory was missed")
 	}
 }

@@ -44,7 +44,7 @@ func Move(src, dst string, progress Progress) error {
 	// it is in the way.
 	os.RemoveAll(dst + PartialSuffix)
 
-	err := os.Rename(src, dst)
+	err := renameNoReplace(src, dst)
 	if err == nil {
 		return nil
 	}
@@ -70,13 +70,15 @@ func copyAndPublish(src, dst string, progress Progress) error {
 		os.RemoveAll(partial)
 		return fmt.Errorf("move %q: %w", dst, os.ErrExist)
 	}
-	if err := os.Rename(partial, dst); err != nil {
+	if err := renameNoReplace(partial, dst); err != nil {
 		os.RemoveAll(partial)
 		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
 	// The name must reach the disk too, or a power cut would leave the file
 	// without a name.
-	syncDir(filepath.Dir(dst))
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(src); err != nil {
 		// The copy is whole and in place. The source is a leftover: it is
 		// said apart from a failed copy, because the move did succeed.
@@ -99,17 +101,18 @@ func Size(path string) (int64, error) {
 	return info.Size(), nil
 }
 
-// syncDir makes the changes in a directory reach the disk.
-//
-// Best effort: some filesystems refuse it, and a missing flush is not worth
-// failing a move over.
-func syncDir(dir string) {
+// syncDir persists directory entries before the source can be removed.
+func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return err
 	}
-	defer d.Close()
-	_ = d.Sync()
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sync directory %q: %w", dir, syncErr)
+	}
+	return closeErr
 }
 
 // CopyTree copies src to dst.
@@ -169,7 +172,7 @@ func (c *copier) copy(src, dst string) error {
 			return err
 		}
 		restoreTimes(src, dst)
-		return nil
+		return syncDir(dst)
 
 	case info.Mode().IsRegular():
 		return c.copyFile(src, dst, info)

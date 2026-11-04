@@ -597,3 +597,23 @@ func TestAChangedPasswordEndsTheSession(t *testing.T) {
 		t.Fatalf("the dashboard returned %d, want %d", resp.StatusCode, http.StatusSeeOther)
 	}
 }
+
+func TestRemoveRejectsInvalidIDs(t *testing.T) {
+	for _, values := range []url.Values{
+		{"plan_id": {"broken"}, "move_id": {"1"}},
+		{"plan_id": {"1"}, "move_id": {"broken"}},
+		{"plan_id": {"1"}, "move_id": {"0"}},
+		{"plan_id": {"1"}, "move_id": {"-1"}},
+	} {
+		t.Run(values.Encode(), func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/plan/remove", strings.NewReader(values.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			s := &Server{}
+			s.handleRemove(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want %d", w.Code, http.StatusBadRequest)
+			}
+		})
+	}
+}

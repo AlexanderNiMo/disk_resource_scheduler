@@ -155,7 +155,21 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 
 // handleRemove takes one file out of the plan: it stays where it is.
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Remove(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	moveID, err := formInt(r, "move_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if moveID <= 0 {
+		s.badRequest(w, r, fmt.Errorf("move_id: want a positive number, got %d", moveID))
+		return
+	}
+	if err := s.sch.Remove(planID, moveID); err != nil {
 		s.fail(w, r, err)
 		return
 	}

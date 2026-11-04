@@ -71,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /scan", s.auth(s.handleScan))
 	mux.Handle("POST /plan/approve", s.auth(s.handleApprove))
 	mux.Handle("POST /plan/reject", s.auth(s.handleReject))
+	mux.Handle("POST /plan/remove", s.auth(s.handleRemove))
 	mux.Handle("POST /plan/rollback", s.auth(s.handleRollback))
 
 	mux.Handle("GET /api/plan", s.auth(s.apiPlan))
@@ -78,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /api/scan", s.auth(s.handleScan))
 	mux.Handle("POST /api/plan/approve", s.auth(s.handleApprove))
 	mux.Handle("POST /api/plan/reject", s.auth(s.handleReject))
+	mux.Handle("POST /api/plan/remove", s.auth(s.handleRemove))
 	mux.Handle("POST /api/plan/rollback", s.auth(s.handleRollback))
 
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.tmpl.static))))

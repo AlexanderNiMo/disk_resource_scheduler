@@ -2,6 +2,7 @@ package disk
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -239,5 +240,55 @@ func TestCopyTreeRefusesAnExistingDestination(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dst, "somebody-elses.mkv"))
 	if err != nil || string(body) != "not ours" {
 		t.Fatalf("the file in the destination was touched: %q %v", body, err)
+	}
+}
+
+func TestAtomicRenameNeverReplacesADestination(t *testing.T) {
+	for _, directory := range []bool{false, true} {
+		t.Run(fmt.Sprint(directory), func(t *testing.T) {
+			root := t.TempDir()
+			src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
+			if directory {
+				os.Mkdir(src, 0700)
+				os.Mkdir(dst, 0700)
+			} else {
+				writeFile(t, src, "ours")
+				writeFile(t, dst, "theirs")
+			}
+			if err := renameNoReplace(src, dst); !errors.Is(err, os.ErrExist) {
+				t.Fatalf("got %v, want EEXIST", err)
+			}
+			if _, err := os.Lstat(src); err != nil {
+				t.Fatal("source disappeared", err)
+			}
+			if !directory {
+				data, _ := os.ReadFile(dst)
+				if string(data) != "theirs" {
+					t.Fatal("destination overwritten")
+				}
+			}
+		})
+	}
+}
+
+func TestCopyDoesNotReplaceAFileCreatedDuringCopy(t *testing.T) {
+	root := t.TempDir()
+	src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
+	writeFile(t, src, "ours")
+	err := copyAndPublish(src, dst, func(int64) { writeFile(t, dst, "theirs") })
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("got %v, want EEXIST", err)
+	}
+	for path, want := range map[string]string{src: "ours", dst: "theirs"} {
+		data, _ := os.ReadFile(path)
+		if string(data) != want {
+			t.Fatalf("changed %s: %q", path, data)
+		}
+	}
+}
+
+func TestSyncDirectoryReportsErrors(t *testing.T) {
+	if err := syncDir(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing directory was not reported")
 	}
 }

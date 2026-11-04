@@ -1,6 +1,7 @@
 package disk
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,6 +88,40 @@ func TestCopyTreeFailsAndKeepsTheSource(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
 		t.Fatalf("the source is gone: %v", err)
+	}
+}
+
+// The copy is in place and whole, but the source cannot be removed. The
+// move says so apart from a failed copy: the entry IS at the destination.
+func TestMoveSaysWhenTheSourceCannotBeRemoved(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions")
+	}
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	writeFile(t, filepath.Join(src, "movie.mkv"), "hello")
+	// The source cannot be removed: its directory is read-only.
+	if err := os.Chmod(src, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(src, 0o755)
+
+	// The copy of another volume: the copy goes to a name of its own and is
+	// put in place at the end.
+	err := copyAndPublish(filepath.Join(src, "movie.mkv"), filepath.Join(dst, "movie.mkv"), nil)
+	if err == nil {
+		t.Fatal("want an error when the source cannot be removed")
+	}
+	if !errors.Is(err, ErrSourceNotRemoved) {
+		t.Fatalf("the move returned %v, want %v", err, ErrSourceNotRemoved)
+	}
+	// The copy is in place and whole.
+	body, readErr := os.ReadFile(filepath.Join(dst, "movie.mkv"))
+	if readErr != nil || string(body) != "hello" {
+		t.Fatalf("the file at the destination is %q %v, want the whole file", body, readErr)
 	}
 }
 

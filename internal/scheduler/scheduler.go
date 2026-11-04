@@ -468,18 +468,17 @@ func (s *Scheduler) Reject(planID int) error {
 // that runs after the execution replaces the current plan, and the files
 // that were moved are still worth putting back.
 func (s *Scheduler) Rollback(planID, moveID int) error {
-	s.mu.Lock()
+	s.mu.RLock()
 	if !s.scan.Scanned {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return ErrNotScanned
 	}
 	if s.st == StateRunning || s.st == StateRollingBack {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return ErrBusy
 	}
 	current := s.plan
-	previous := s.st
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	plan := current
 	if plan == nil || plan.ID != planID {
@@ -489,6 +488,10 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 		return fmt.Errorf("there is no plan #%d", planID)
 	}
 
+	// The statuses are read under the lock: the executor writes them
+	// while it moves the files, and it writes them into this very plan
+	// when it is the current one.
+	s.mu.RLock()
 	var targets []int
 	for i := range plan.Moves {
 		move := plan.Moves[i]
@@ -500,18 +503,27 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 		}
 		targets = append(targets, i)
 	}
+	s.mu.RUnlock()
 	if len(targets) == 0 {
 		return fmt.Errorf("there is nothing to roll back")
 	}
 	// The last thing moved goes back first.
 	sort.Slice(targets, func(i, j int) bool { return targets[i] > targets[j] })
 
-	isCurrent := current != nil && current.ID == planID
+	// The state is checked and set in one go. An approval that came in
+	// between the two would start the execution, and the rollback would
+	// then move the same files at the same time.
 	s.mu.Lock()
+	if s.st == StateRunning || s.st == StateRollingBack {
+		s.mu.Unlock()
+		return ErrBusy
+	}
 	if !s.reserveLocked() {
 		s.mu.Unlock()
 		return ErrStopping
 	}
+	isCurrent := s.plan != nil && s.plan.ID == planID
+	previous := s.st
 	s.st = StateRollingBack
 	s.epoch++
 	s.mu.Unlock()
@@ -682,11 +694,31 @@ func (s *Scheduler) execute(plan *Plan, resume bool) {
 				// not saved.
 				s.setMove(plan, i, StatusDone, "")
 				continue
+			case sourceErr == nil && destErr == nil:
+				// Both are there: the copy was published and the source was
+				// not removed. If the copy is whole, the move is done and
+				// the source is a leftover.
+				if s.copyIsWhole(move) {
+					s.removeLeftover(move)
+					s.setMove(plan, i, StatusDone, "источник не удалился")
+					continue
+				}
+				s.setMove(plan, i, StatusFailed, "и источник, и приёмник на месте")
+				continue
 			case sourceErr != nil:
 				s.setMove(plan, i, StatusFailed, "источника нет на месте")
 				continue
 			}
 		}
+
+		// The plan may have waited for an approval for hours, and the file
+		// may have been written again since: a download that started over.
+		// Moving it now would move half a file and delete the original.
+		if s.changedRecently(move.Path) {
+			s.setMove(plan, i, StatusFailed, "файл изменился после составления плана")
+			continue
+		}
+
 		s.transfer(plan, i, move.Path, move.DstPath, StatusDone)
 	}
 	s.finish(plan, "plan")
@@ -786,6 +818,15 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, okStatus st
 			s.setMove(plan, index, okStatus, "")
 			return
 		}
+		if errors.Is(err, disk.ErrSourceNotRemoved) {
+			// The copy is in place and whole; only the source is left
+			// behind. The move succeeded, and a retry would find the
+			// destination taken.
+			s.log.Warn("the entry is moved, but the source is left behind",
+				"from", from, "to", to, "attempt", attempt, "error", err)
+			s.setMove(plan, index, okStatus, "источник не удалился")
+			return
+		}
 		lastErr = err
 		s.log.Warn("the move failed", "from", from, "to", to, "attempt", attempt, "error", err)
 		if attempt < moveAttempts {
@@ -811,6 +852,47 @@ func (s *Scheduler) stillConfigured(move Move) error {
 		return errors.New("папка-приёмник убрана из конфига или сменила тип")
 	}
 	return nil
+}
+
+// changedRecently tells whether the file was changed within min_age.
+//
+// A file that is written right now is not media yet: it is being downloaded
+// or unpacked. Moving it would move half a file and delete the original.
+func (s *Scheduler) changedRecently(path string) bool {
+	minAge := time.Duration(s.cfg.Load().Scan.MinAge)
+	if minAge <= 0 {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		// The file is gone: the move fails on its own.
+		return false
+	}
+	return info.ModTime().After(time.Now().Add(-minAge))
+}
+
+// copyIsWhole tells whether the copy at the destination is the whole entry.
+//
+// The copy is published under its final name with a rename, so a file that is
+// there with the size of the entry is the copy the daemon made.
+func (s *Scheduler) copyIsWhole(move Move) bool {
+	size, err := disk.Size(move.DstPath)
+	if err != nil {
+		return false
+	}
+	return size == move.Size
+}
+
+// removeLeftover removes the source that was left behind.
+//
+// The copy is in place and whole, so the source is a duplicate that takes up
+// the space the daemon was trying to free.
+func (s *Scheduler) removeLeftover(move Move) {
+	if err := os.RemoveAll(move.Path); err != nil {
+		s.log.Warn("could not remove the leftover", "path", move.Path, "error", err)
+		return
+	}
+	s.log.Info("the leftover of the copy is removed", "path", move.Path)
 }
 
 // finish closes a plan and puts it into the history.

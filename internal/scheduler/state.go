@@ -52,10 +52,31 @@ func (s *StateStore) Save(st State, plan *Plan) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("write the state file: %w", err)
 	}
+	// The data must reach the disk before the name is changed: a power cut
+	// in between would leave a state file that is there but empty, and the
+	// plan waiting for an approval would be lost.
+	if f, err := os.Open(tmp); err == nil {
+		_ = f.Sync()
+		f.Close()
+	}
 	if err := os.Rename(tmp, s.path); err != nil {
 		return fmt.Errorf("replace the state file: %w", err)
 	}
+	syncDir(filepath.Dir(s.path))
 	return nil
+}
+
+// syncDir makes the changes in a directory reach the disk.
+//
+// Best effort: some filesystems refuse it, and a missing flush is not worth
+// failing a save over.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // Load reads the state and the plan.

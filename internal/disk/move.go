@@ -20,6 +20,13 @@ type Progress func(copied int64)
 // picked up by the next attempt under a name the daemon owns.
 const PartialSuffix = ".drs-partial"
 
+// ErrSourceNotRemoved means the copy is in place and the source could not
+// be removed.
+//
+// It is not a failed move: the entry is at the destination and is whole.
+// The source is a leftover that takes up space until somebody removes it.
+var ErrSourceNotRemoved = errors.New("the source could not be removed")
+
 // Move moves the entry at src to dst.
 //
 // The same filesystem is a rename; a different one is a copy followed by the
@@ -44,9 +51,15 @@ func Move(src, dst string, progress Progress) error {
 	if !errors.Is(err, syscall.EXDEV) {
 		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
+	return copyAndPublish(src, dst, progress)
+}
 
-	// The copy goes to a name of its own and is put in place at the end, so
-	// that nothing of somebody else is ever written into or deleted.
+// copyAndPublish copies the entry to another volume and puts it in place.
+//
+// The copy goes to a name of its own and is put in place at the end, so
+// that nothing of somebody else is ever written into or deleted. The source
+// is removed only after the copy is in place.
+func copyAndPublish(src, dst string, progress Progress) error {
 	partial := dst + PartialSuffix
 	if err := CopyTree(src, partial, progress); err != nil {
 		os.RemoveAll(partial)
@@ -61,10 +74,42 @@ func Move(src, dst string, progress Progress) error {
 		os.RemoveAll(partial)
 		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
+	// The name must reach the disk too, or a power cut would leave the file
+	// without a name.
+	syncDir(filepath.Dir(dst))
 	if err := os.RemoveAll(src); err != nil {
-		return fmt.Errorf("remove the source %q: %w", src, err)
+		// The copy is whole and in place. The source is a leftover: it is
+		// said apart from a failed copy, because the move did succeed.
+		return fmt.Errorf("%w: %q: %w", ErrSourceNotRemoved, src, err)
 	}
 	return nil
+}
+
+// Size returns the size of the entry: the size of the file, or the sum of
+// the sizes of the files in the tree.
+func Size(path string) (int64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.IsDir() {
+		size, _, err := treeStat(path)
+		return size, err
+	}
+	return info.Size(), nil
+}
+
+// syncDir makes the changes in a directory reach the disk.
+//
+// Best effort: some filesystems refuse it, and a missing flush is not worth
+// failing a move over.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // CopyTree copies src to dst.
@@ -142,6 +187,12 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 		return err
 	}
 	_, err = io.Copy(out, &countingReader{reader: in, counter: c})
+	// The data must reach the disk before the file is closed: the source is
+	// removed after the copy, and a power cut in between must not leave a
+	// file that is there but empty.
+	if syncErr := out.Sync(); err == nil {
+		err = syncErr
+	}
 	if closeErr := out.Close(); err == nil {
 		err = closeErr
 	}

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -81,7 +82,12 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 
 // handleApprove starts the execution of the plan.
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Approve(formInt(r, "plan_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if err := s.sch.Approve(planID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -90,7 +96,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 
 // handleReject throws the plan away.
 func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Reject(formInt(r, "plan_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if err := s.sch.Reject(planID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -99,7 +110,21 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 
 // handleRollback puts one move back, or all of them when move_id is zero.
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Rollback(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	moveID, err := formInt(r, "move_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if moveID < 0 {
+		s.badRequest(w, r, fmt.Errorf("move_id: want zero or a number, got %d", moveID))
+		return
+	}
+	if err := s.sch.Rollback(planID, moveID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -120,6 +145,20 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, status int, payl
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if isAPI(r) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	view := s.buildView(r, true)
+	view.Error = err.Error()
+	s.render(w, r, "dashboard", view)
+}
+
+// badRequest reports a form that cannot be read.
+//
+// It is a different answer from fail: the request was never understood,
+// so it is not a conflict with what the daemon is doing.
+func (s *Server) badRequest(w http.ResponseWriter, r *http.Request, err error) {
+	if isAPI(r) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	view := s.buildView(r, true)

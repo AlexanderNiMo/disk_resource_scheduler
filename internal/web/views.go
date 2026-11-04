@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -254,10 +255,18 @@ func moveStatusText(status string) string {
 }
 
 // formInt reads a number from the form.
-func formInt(r *http.Request, name string) int {
-	value, err := strconv.Atoi(r.PostFormValue(name))
-	if err != nil {
-		return 0
+//
+// A number that cannot be read is an error and not a zero: a zero means
+// "all" in some of the calls, and a typo in the field must not turn into
+// "do everything".
+func formInt(r *http.Request, name string) (int, error) {
+	value := r.PostFormValue(name)
+	if value == "" {
+		return 0, fmt.Errorf("%s: want a number, got nothing", name)
 	}
-	return value
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s: want a number, got %q", name, value)
+	}
+	return number, nil
 }

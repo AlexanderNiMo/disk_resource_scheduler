@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -285,6 +286,77 @@ func TestBuildPlanSkipsSymlinks(t *testing.T) {
 	// The size of the symlink is not counted as freed space either.
 	if plan.Moves[0].Size != 20*gb {
 		t.Fatalf("the move is %d bytes, want %d", plan.Moves[0].Size, 20*gb)
+	}
+}
+
+// Two entries of the same name from two sources cannot both go to the same
+// destination: the second one would find the place taken.
+func TestBuildPlanGivesEachMoveItsOwnPlace(t *testing.T) {
+	cfg, m := fixture(
+		[]config.Folder{
+			folder("/src-a", config.DirTypeSrc, 2, 50*gb),
+			folder("/src-b", config.DirTypeSrc, 2, 50*gb),
+			folder("/dst", config.DirTypeDst, 2, 0),
+		},
+		map[string]disk.Volume{
+			"/src-a": {Dev: 1, Free: 10 * gb},
+			"/src-b": {Dev: 2, Free: 10 * gb},
+			"/dst":   {Dev: 3, Free: 500 * gb},
+		},
+		map[string][]disk.Entry{
+			"/src-a": {{Name: "Show.S01", Path: "/src-a/Show.S01", Size: 20 * gb}},
+			"/src-b": {{Name: "Show.S01", Path: "/src-b/Show.S01", Size: 20 * gb}},
+		},
+	)
+
+	plan := buildPlan(cfg, m, time.Now(), 1)
+	places := map[string]bool{}
+	for _, move := range plan.Moves {
+		if places[move.DstPath] {
+			t.Fatalf("two moves share the place %q: %+v", move.DstPath, plan.Moves)
+		}
+		places[move.DstPath] = true
+	}
+}
+
+// A name that is taken at the freest destination does not stop the entry:
+// another destination of the same type can take it.
+func TestBuildPlanTriesAnotherDestinationWhenTheNameIsTaken(t *testing.T) {
+	root := t.TempDir()
+	freest := filepath.Join(root, "dst-freest")
+	other := filepath.Join(root, "dst-other")
+	if err := os.MkdirAll(freest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(freest, "Show.S01"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, m := fixture(
+		[]config.Folder{
+			folder("/src", config.DirTypeSrc, 2, 50*gb),
+			folder(freest, config.DirTypeDst, 2, 0),
+			folder(other, config.DirTypeDst, 2, 0),
+		},
+		map[string]disk.Volume{
+			"/src": {Dev: 1, Free: 10 * gb},
+			freest: {Dev: 2, Free: 900 * gb},
+			other:  {Dev: 3, Free: 500 * gb},
+		},
+		map[string][]disk.Entry{
+			"/src": {{Name: "Show.S01", Path: "/src/Show.S01", Size: 20 * gb}},
+		},
+	)
+
+	plan := buildPlan(cfg, m, time.Now(), 1)
+	if len(plan.Moves) != 1 {
+		t.Fatalf("got %+v, want the move to the other destination", plan.Moves)
+	}
+	if plan.Moves[0].Dst != other {
+		t.Fatalf("the move goes to %q, want the one without the file: %q", plan.Moves[0].Dst, other)
 	}
 }
 
@@ -614,6 +686,65 @@ func TestMoveIsRetriedAfterAFailure(t *testing.T) {
 	}
 }
 
+// A file that was written again after the plan was made is not moved: it
+// would be moved half-written and the original would be deleted.
+func TestAMoveThatWasWrittenAgainIsNotMoved(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	path := filepath.Join(src, "movie.mkv")
+	os.WriteFile(path, []byte("hello"), 0o644)
+	// The file was old enough to be planned.
+	old := time.Now().Add(-48 * time.Hour)
+	os.Chtimes(path, old, old)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(24 * time.Hour)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	sch := newTestScheduler(t, cfg, probe)
+
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if len(plan.Moves) != 1 {
+		t.Fatalf("the plan has %+v, want the old file", plan.Moves)
+	}
+
+	// The download starts over: the file is written again.
+	os.WriteFile(path, []byte("HALF"), 0o644)
+
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	waitFor(t, "the move to finish", func() bool {
+		state, _ := sch.Snapshot()
+		return state == StateDone || state == StateFailed
+	})
+
+	_, plan = sch.Snapshot()
+	if plan.Moves[0].Status != StatusFailed {
+		t.Fatalf("the move is %q, want it to be refused", plan.Moves[0].Status)
+	}
+	// The source is still there, and the destination is empty.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the source is gone: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "movie.mkv")); err == nil {
+		t.Fatal("the file was moved anyway")
+	}
+}
+
 func TestAMoveNeverTouchesAFileItDidNotCreate(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
@@ -934,5 +1065,55 @@ func TestTheStopAndTheApprovalDoNotCollide(t *testing.T) {
 		go func() { defer wg.Done(); sch.Stop(context.Background()) }()
 		go func() { defer wg.Done(); sch.Approve(plan.ID) }()
 		wg.Wait()
+	}
+}
+
+// A rollback and an approval at the same time must not move the same file
+// twice and must not upset the runtime.
+//
+// The rollback reads the statuses of the moves of the plan while the
+// executor writes them: the race detector finds it when both run at once.
+func TestTheRollbackAndTheApprovalDoNotCollide(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src")
+		dst := filepath.Join(dir, "dst")
+		os.MkdirAll(src, 0o755)
+		os.MkdirAll(dst, 0o755)
+		for j := 0; j < 20; j++ {
+			name := fmt.Sprintf("m%02d.mkv", j)
+			if err := os.WriteFile(filepath.Join(src, name), []byte(name), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		cfg := &config.Config{
+			Folders: map[string]config.Folder{
+				src: folder(src, config.DirTypeSrc, 2, 50*gb),
+				dst: folder(dst, config.DirTypeDst, 2, 0),
+			},
+			Scan: config.Scan{MinAge: config.Duration(0)},
+		}
+		probe := fakeProbe{volumes: map[string]disk.Volume{
+			src: {Dev: 1, Free: 1 * gb},
+			dst: {Dev: 2, Free: 500 * gb},
+		}}
+		sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), NewHistory(dir))
+		if err := sch.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		waitFor(t, "the scan", func() bool { return sch.ScanStatus().Scanned })
+		_, plan := sch.Snapshot()
+
+		// The plan waits for an approval. The rollback and the approval
+		// arrive at the same time: the rollback reads the statuses of the
+		// moves while the executor writes them.
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); sch.Rollback(plan.ID, 0) }()
+		go func() { defer wg.Done(); sch.Approve(plan.ID) }()
+		wg.Wait()
+		time.Sleep(20 * time.Millisecond)
+		sch.Stop(context.Background())
 	}
 }

@@ -59,6 +59,10 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 	}
 
 	minAge := time.Duration(cfg.Scan.MinAge)
+	// The places this plan has already taken. Two entries of the same name
+	// from two sources cannot both go to the same destination: the second
+	// one would find the place taken and fail.
+	claimed := map[string]bool{}
 	for _, folder := range folders {
 		if folder.DirType != config.DirTypeSrc {
 			continue
@@ -96,15 +100,13 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 				continue
 			}
 
-			dst, dstVolume, ok := pickDestination(folders, m, free, entry, folder.Type, volume.Dev)
+			dst, dstVolume, ok := pickDestination(folders, m, free, entry, folder.Type, volume.Dev, claimed)
 			if !ok {
 				// There is nowhere for it to go: it stays where it is.
 				continue
 			}
-			if _, err := os.Lstat(filepath.Join(dst.Path, entry.Name)); err == nil {
-				// The destination has a file of that name already.
-				continue
-			}
+			dstPath := filepath.Join(dst.Path, entry.Name)
+			claimed[dstPath] = true
 
 			plan.Moves = append(plan.Moves, Move{
 				ID:      len(plan.Moves) + 1,
@@ -112,7 +114,7 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 				Name:    entry.Name,
 				Path:    entry.Path,
 				Dst:     dst.Path,
-				DstPath: filepath.Join(dst.Path, entry.Name),
+				DstPath: dstPath,
 				Size:    entry.Size,
 				Type:    folder.Type,
 				Status:  StatusPending,
@@ -127,7 +129,11 @@ func buildPlan(cfg *config.Config, m measured, now time.Time, planID int) *Plan 
 
 // pickDestination chooses where an entry goes: the dst folder of the same
 // type on another volume with the most free space, that can still take it.
-func pickDestination(folders []config.Folder, m measured, free map[uint64]int64, entry disk.Entry, wantType int, srcDev uint64) (config.Folder, disk.Volume, bool) {
+//
+// A folder that already holds a file of that name is not a candidate: the
+// entry would find the place taken. The same goes for a place another move
+// of this plan has already taken.
+func pickDestination(folders []config.Folder, m measured, free map[uint64]int64, entry disk.Entry, wantType int, srcDev uint64, claimed map[string]bool) (config.Folder, disk.Volume, bool) {
 	var best config.Folder
 	var bestVolume disk.Volume
 	bestFree := int64(-1)
@@ -146,6 +152,15 @@ func pickDestination(folders []config.Folder, m measured, free map[uint64]int64,
 			continue
 		}
 		if free[volume.Dev]-int64(candidate.MinFree) < entry.Size {
+			continue
+		}
+		path := filepath.Join(candidate.Path, entry.Name)
+		if claimed[path] {
+			// Another move of this plan already takes that place.
+			continue
+		}
+		if _, err := os.Lstat(path); err == nil {
+			// The destination has a file of that name already.
 			continue
 		}
 		if free[volume.Dev] > bestFree {

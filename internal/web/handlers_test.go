@@ -292,6 +292,41 @@ func TestApprovingBeforeTheFirstScanIsRefused(t *testing.T) {
 	}
 }
 
+// A move_id that cannot be read is an error and not a zero: a zero means
+// "roll back everything".
+func TestARollbackWithABrokenMoveIDIsRefused(t *testing.T) {
+	server := newTestServer(t)
+	client := login(t, server)
+
+	page, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse the url: %v", err)
+	}
+	token := ""
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			token = cookie.Value
+		}
+	}
+
+	for _, moveID := range []string{"", "abc", "-1"} {
+		resp, err := client.PostForm(server.URL+"/api/plan/rollback", url.Values{
+			"plan_id":    {"1"},
+			"move_id":    {moveID},
+			"csrf_token": {token},
+		})
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("the rollback with move_id %q returned %d, want %d: %s",
+				moveID, resp.StatusCode, http.StatusBadRequest, body)
+		}
+	}
+}
+
 func TestTheManualScanMeasuresEveryFolder(t *testing.T) {
 	root := t.TempDir()
 	folders := map[string]config.Folder{}

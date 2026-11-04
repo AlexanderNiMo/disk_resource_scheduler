@@ -70,6 +70,64 @@ func TestCopyTreeKeepsModeAndTime(t *testing.T) {
 	}
 }
 
+// The umask must not eat the mode: a file that the group can write stays
+// that way after the copy.
+func TestCopyTreeKeepsTheModeOfAGroupWritableFile(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "copy")
+
+	writeFile(t, filepath.Join(src, "movie.mkv"), "abc")
+	if err := os.Chmod(filepath.Join(src, "movie.mkv"), 0o664); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if err := CopyTree(src, dst, nil); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dst, "movie.mkv"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o664 {
+		t.Fatalf("the mode is %o, want 664", info.Mode().Perm())
+	}
+}
+
+// A directory that is read-only still holds files: the copy puts them in
+// and sets the mode at the end.
+func TestCopyTreeOfAReadOnlyDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions")
+	}
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "copy")
+
+	writeFile(t, filepath.Join(src, "Show.S01", "ep01.mkv"), "abc")
+	if err := os.Chmod(filepath.Join(src, "Show.S01"), 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(filepath.Join(src, "Show.S01"), 0o755)
+
+	if err := CopyTree(src, dst, nil); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	// The copy is read-only, like the source: the test needs to be able to
+	// take it away again.
+	defer os.Chmod(filepath.Join(dst, "Show.S01"), 0o755)
+
+	info, err := os.Stat(filepath.Join(dst, "Show.S01"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o555 {
+		t.Fatalf("the mode is %o, want 555", info.Mode().Perm())
+	}
+	if _, err := os.Stat(filepath.Join(dst, "Show.S01", "ep01.mkv")); err != nil {
+		t.Fatalf("the file is not in the copy: %v", err)
+	}
+}
+
 func TestCopyTreeFailsAndKeepsTheSource(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root writes into a read-only directory")

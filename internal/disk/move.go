@@ -150,7 +150,10 @@ func (c *copier) copy(src, dst string) error {
 	case info.IsDir():
 		// Mkdir, not MkdirAll: a directory that is already there means the
 		// copy would mix our files with somebody else's.
-		if err := os.Mkdir(dst, info.Mode().Perm()); err != nil {
+		//
+		// The mode of the source is set at the end: a directory that is
+		// read-only would not take the files of the copy.
+		if err := os.Mkdir(dst, 0o700); err != nil {
 			return err
 		}
 		items, err := os.ReadDir(src)
@@ -161,6 +164,9 @@ func (c *copier) copy(src, dst string) error {
 			if err := c.copy(filepath.Join(src, item.Name()), filepath.Join(dst, item.Name())); err != nil {
 				return err
 			}
+		}
+		if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+			return err
 		}
 		restoreTimes(src, dst)
 		return nil
@@ -182,7 +188,7 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 
 	// O_EXCL: the file must not be there yet, or the copy would overwrite
 	// what is already there.
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -197,6 +203,11 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 		err = closeErr
 	}
 	if err != nil {
+		return err
+	}
+	// The mode of the source is set here: the umask would have eaten it
+	// when the file was created.
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
 		return err
 	}
 	restoreTimes(src, dst)

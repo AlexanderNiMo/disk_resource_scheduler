@@ -12,6 +12,48 @@ import (
 	"github.com/alex/disk_resource_scheduler/internal/disk"
 )
 
+// The plan numbers continue after the history: a rollback looks the plan up
+// by its number, and two plans with one number would be the wrong plan.
+func TestThePlanNumbersContinueAfterTheHistory(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	history := NewHistory(dir)
+	// An old plan sits in the history, and the state file is gone.
+	if err := history.Append(HistoryEntry{ID: 7, Kind: "plan", CreatedAt: time.Now(), State: "done"}); err != nil {
+		t.Fatal(err)
+	}
+
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), history)
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+	waitFor(t, "the first scan", func() bool { return sch.ScanStatus().Scanned })
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if plan.ID <= 7 {
+		t.Fatalf("the plan is #%d, want a number after #7", plan.ID)
+	}
+}
+
 func TestThePlanSurvivesARestart(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")

@@ -510,6 +510,87 @@ func TestApproveExecutesTheMoves(t *testing.T) {
 	}
 }
 
+// The state file holds the whole plan, so writing it after every move would
+// rewrite hundreds of kilobytes for every move.
+func TestTheStateFileIsNotWrittenAfterEveryMove(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	const moves = 40
+	for i := 0; i < moves; i++ {
+		name := fmt.Sprintf("m%02d.mkv", i)
+		os.WriteFile(filepath.Join(src, name), []byte("hello"), 0o644)
+	}
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	store := NewStateStore(dir)
+	sch := New(config.NewStore(cfg), testLogger(), probe, store, NewHistory(dir))
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+	waitFor(t, "the first scan", func() bool { return sch.ScanStatus().Scanned })
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if len(plan.Moves) != moves {
+		t.Fatalf("the plan has %d moves, want %d", len(plan.Moves), moves)
+	}
+
+	// Count the writes: the file grows and shrinks, and every write is a new
+	// copy of the whole plan.
+	writes := 0
+	var lastSize int64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if info, err := os.Stat(store.Path()); err == nil {
+				if info.Size() != lastSize {
+					lastSize = info.Size()
+					writes++
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	waitFor(t, "the moves to finish", func() bool {
+		state, _ := sch.Snapshot()
+		return state == StateDone || state == StateFailed
+	})
+	close(stop)
+	<-done
+
+	// The whole plan is written every hundred moves, so a plan of forty is
+	// written once and not forty times.
+	if writes > 3 {
+		t.Fatalf("the state file was written %d times for %d moves", writes, moves)
+	}
+}
+
 func TestApproveRefusesAStalePlan(t *testing.T) {
 	sch := newTestScheduler(t, &config.Config{}, fakeProbe{})
 	if err := sch.Scan(context.Background()); err != nil {
@@ -517,6 +598,60 @@ func TestApproveRefusesAStalePlan(t *testing.T) {
 	}
 	if err := sch.Approve(7); err != ErrStalePlan && err != ErrNoPlan {
 		t.Fatalf("approve returned %v, want a stale plan or no plan", err)
+	}
+}
+
+// A plan that is already done is not approved again: the history would get
+// a second entry for the same plan.
+func TestApprovingAFinishedPlanIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	history := NewHistory(dir)
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), history)
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+	waitFor(t, "the first scan", func() bool { return sch.ScanStatus().Scanned })
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if err := sch.Approve(plan.ID); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	waitFor(t, "the moves to finish", func() bool {
+		state, _ := sch.Snapshot()
+		return state == StateDone
+	})
+
+	// The plan is done. Approving it again must not write a second entry
+	// into the history.
+	if err := sch.Approve(plan.ID); !errors.Is(err, ErrStalePlan) {
+		t.Fatalf("the second approval returned %v, want %v", err, ErrStalePlan)
+	}
+	entries, err := history.List()
+	if err != nil {
+		t.Fatalf("the history: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("the history has %d entries, want 1", len(entries))
 	}
 }
 
@@ -566,6 +701,54 @@ func TestRejectDiscardsThePlan(t *testing.T) {
 	state, plan := sch.Snapshot()
 	if state != StateIdle || plan != nil {
 		t.Fatalf("the plan is still there: %s %+v", state, plan)
+	}
+}
+
+// A rejected plan moved nothing, and the history says so.
+func TestARejectedPlanReportsNoBytes(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644)
+
+	cfg := &config.Config{
+		Folders: map[string]config.Folder{
+			src: folder(src, config.DirTypeSrc, 2, 50*gb),
+			dst: folder(dst, config.DirTypeDst, 2, 0),
+		},
+		Scan: config.Scan{MinAge: config.Duration(0)},
+	}
+	probe := fakeProbe{volumes: map[string]disk.Volume{
+		src: {Dev: 1, Free: 1 * gb},
+		dst: {Dev: 2, Free: 500 * gb},
+	}}
+	history := NewHistory(dir)
+	sch := New(config.NewStore(cfg), testLogger(), probe, NewStateStore(dir), history)
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+	waitFor(t, "the first scan", func() bool { return sch.ScanStatus().Scanned })
+	if err := sch.Scan(context.Background()); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	_, plan := sch.Snapshot()
+	if err := sch.Reject(plan.ID); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	entries, err := history.List()
+	if err != nil {
+		t.Fatalf("the history: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("the history has %d entries, want 1", len(entries))
+	}
+	if entries[0].Bytes != 0 || entries[0].MovesCount != 0 {
+		t.Fatalf("the rejected plan reports %d bytes and %d moves, want none",
+			entries[0].Bytes, entries[0].MovesCount)
 	}
 }
 
@@ -856,19 +1039,19 @@ func TestAScanIsThrownAwayWhenThePlanChangesUnderIt(t *testing.T) {
 		return state == StateDone
 	})
 
-	// A slow scan starts, and the plan is approved again while it runs: the
-	// measurement it took is stale.
+	// A slow scan starts, and the plan is rejected while it runs: the
+	// measurement it took is stale, and it must not be published.
 	probe.setDelay(200 * time.Millisecond)
 	go sch.Scan(context.Background())
 	time.Sleep(50 * time.Millisecond)
-	if err := sch.Approve(plan.ID); err != nil {
-		t.Fatalf("the second approve: %v", err)
+	if err := sch.Reject(plan.ID); err != nil {
+		t.Fatalf("the reject: %v", err)
 	}
 
 	waitFor(t, "the scan to finish", func() bool { return !sch.ScanStatus().Running })
 	_, after := sch.Snapshot()
-	if after.ID != plan.ID {
-		t.Fatalf("the plan is #%d, want the old one #%d", after.ID, plan.ID)
+	if after != nil {
+		t.Fatalf("the stale scan published a plan: %+v", after)
 	}
 }
 

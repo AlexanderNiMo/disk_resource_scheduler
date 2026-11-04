@@ -218,6 +218,16 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		}
 	}
 
+	// The plan numbers must not collide with the ones in the history: the
+	// history keeps the plans the state file has already forgotten, and a
+	// rollback looks the plan up by its number.
+	if last := s.lastHistoryID(); last > s.next {
+		s.mu.Lock()
+		s.next = last
+		s.mu.Unlock()
+		s.log.Info("the plan numbers continue after the history", "last_plan_id", last)
+	}
+
 	// The folders are measured right away: the daemon should not sit idle
 	// until the first tick of the cron, and there is no plan to make before
 	// the folders are known. A restored plan is not replaced: the scan skips
@@ -229,6 +239,24 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		s.log.Error("the first scan could not be started", "error", err)
 	}
 	return nil
+}
+
+// lastHistoryID returns the number of the last plan in the history.
+//
+// It is zero when there is no history or it cannot be read.
+func (s *Scheduler) lastHistoryID() int {
+	entries, err := s.history.List()
+	if err != nil {
+		s.log.Warn("could not read the history", "error", err)
+		return 0
+	}
+	last := 0
+	for _, entry := range entries {
+		if entry.ID > last {
+			last = entry.ID
+		}
+	}
+	return last
 }
 
 // cleanPartials removes the leftovers of the copies that were cut in the
@@ -421,6 +449,13 @@ func (s *Scheduler) Approve(planID int) error {
 	if s.st == StateRunning || s.st == StateRollingBack {
 		s.mu.Unlock()
 		return ErrBusy
+	}
+	if s.st != StatePending {
+		// The plan is not waiting for an approval: it was already done,
+		// or it was rejected. Approving it again would write a second
+		// entry into the history for the same plan.
+		s.mu.Unlock()
+		return ErrStalePlan
 	}
 	plan := s.plan
 	if !s.reserveLocked() {
@@ -827,7 +862,12 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, okStatus st
 			s.setMove(plan, index, okStatus, "источник не удалился")
 			return
 		}
-		lastErr = err
+		// The first error is the one that says what is wrong: the later
+		// attempts fail because of it, and their messages point at the
+		// wrong thing.
+		if lastErr == nil {
+			lastErr = err
+		}
 		s.log.Warn("the move failed", "from", from, "to", to, "attempt", attempt, "error", err)
 		if attempt < moveAttempts {
 			time.Sleep(retryPause)
@@ -910,12 +950,16 @@ func (s *Scheduler) finish(plan *Plan, kind string) {
 	if failed {
 		st = StateFailed
 	}
+
+	// The history is written before the state says the plan is done: a
+	// reader that sees "done" must see the plan in the history too.
+	s.appendHistory(plan, kind, st, time.Now())
+
 	s.mu.Lock()
 	s.st = st
 	s.mu.Unlock()
 
 	s.save()
-	s.appendHistory(plan, kind, st, time.Now())
 }
 
 // run starts a task in the background and waits for it when the daemon
@@ -970,8 +1014,10 @@ func (s *Scheduler) setMove(plan *Plan, index int, status, message string) {
 	plan.Moves[index].Status = status
 	plan.Moves[index].Error = message
 	s.dirty++
-	write := s.dirty >= saveEveryMoves ||
-		status == StatusDone || status == StatusFailed || status == StatusRolledBack
+	// The state file holds the whole plan, so writing it after every move
+	// would rewrite hundreds of kilobytes for every move. It is written
+	// every hundred changes instead, and once more when the plan is done.
+	write := s.dirty >= saveEveryMoves
 	if write {
 		s.dirty = 0
 	}
@@ -1002,14 +1048,20 @@ func (s *Scheduler) appendHistory(plan *Plan, kind string, st State, at time.Tim
 	s.mu.RUnlock()
 
 	entry := HistoryEntry{
-		ID:         copied.ID,
-		Kind:       kind,
-		CreatedAt:  at,
-		State:      string(st),
-		MovesCount: len(copied.Moves),
-		Plan:       copied,
+		ID:        copied.ID,
+		Kind:      kind,
+		CreatedAt: at,
+		State:     string(st),
+		Plan:      copied,
 	}
+	// Only the moves that were really made are counted: a plan that was
+	// rejected moved nothing, and a plan that failed halfway moved a part
+	// of what it said.
 	for _, move := range copied.Moves {
+		if move.Status != StatusDone && move.Status != StatusRolledBack {
+			continue
+		}
+		entry.MovesCount++
 		entry.Bytes += move.Size
 	}
 	if err := s.history.Append(entry); err != nil {

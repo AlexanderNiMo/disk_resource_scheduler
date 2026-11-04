@@ -153,6 +153,15 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 	s.answer(w, r, http.StatusOK, map[string]string{"status": "rejected"})
 }
 
+// handleRemove takes one file out of the plan: it stays where it is.
+func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
+	if err := s.sch.Remove(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.answer(w, r, http.StatusOK, map[string]string{"status": "removed"})
+}
+
 // handleRollback puts one move back, or all of them when move_id is zero.
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	planID, err := formInt(r, "plan_id")

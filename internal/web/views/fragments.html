@@ -57,6 +57,14 @@
               <button type="submit" class="secondary">Откатить</button>
             </form>
             {{end}}
+            {{if .CanRemove}}
+            <form method="post" action="/plan/remove">
+              <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+              <input type="hidden" name="plan_id" value="{{$.Plan.PlanID}}">
+              <input type="hidden" name="move_id" value="{{.ID}}">
+              <button type="submit" class="secondary">Убрать из плана</button>
+            </form>
+            {{end}}
           </td>
         </tr>
       {{end}}

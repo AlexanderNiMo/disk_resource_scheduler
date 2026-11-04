@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alex/disk_resource_scheduler/internal/disk"
 )
 
 // writeConfig puts a configuration file into a temporary directory.
@@ -148,6 +151,74 @@ func TestABrokenConfigDoesNotStopTheDaemon(t *testing.T) {
 	}
 }
 
+// A config that could not be read is tried again.
+//
+// The daemon tells one version of the file from another by its time and its
+// size. The broken file and the fixed one have the same time and the same
+// size here, so the daemon sees no new version of the file: it has to read
+// the file again to notice that it is fixed.
+func TestABrokenConfigIsTriedAgain(t *testing.T) {
+	stateDir := t.TempDir()
+	// The config the daemon starts with: only alex.
+	first := configBody(stateDir, "    alex: \"secret\"\n")
+	// The config the file holds at the end: alex and bob.
+	fixed := configBody(stateDir, "    alex: \"secret\"\n    bob: \"other\"\n")
+	// The broken file has the size of the fixed one, so that the two are
+	// told apart by their time alone.
+	broken := "folders: [ this is not a config"
+	if len(broken) < len(fixed) {
+		broken += strings.Repeat(" ", len(fixed)-len(broken))
+	} else {
+		fixed += strings.Repeat(" ", len(broken)-len(fixed))
+	}
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(first), 0o600); err != nil {
+		t.Fatalf("write the config: %v", err)
+	}
+
+	daemon, err := New(path, WithPollInterval(20*time.Millisecond))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := daemon.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer daemon.Stop(context.Background())
+
+	// The broken file and the fixed one have the same time and the same
+	// size: the daemon sees one version of the file, not two.
+	stamp := time.Now().Add(-time.Hour)
+	write := func(body string) {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write the config: %v", err)
+		}
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
+	// The daemon has seen the file it started with.
+	time.Sleep(100 * time.Millisecond)
+
+	// The file is broken, and the daemon keeps the old one.
+	write(broken)
+	time.Sleep(100 * time.Millisecond)
+
+	// The file is fixed. It has the size and the time of the broken one, so
+	// the daemon sees no new version: it has to read the file again.
+	write(fixed)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if canLogIn(t, daemon.Addr(), "bob", "other") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the fixed config was never read")
+}
+
 func TestTheListenAddressIsChecked(t *testing.T) {
 	// A config without a port is refused at startup, not at the first request.
 	path := writeConfig(t, strings.Replace(configBody(t.TempDir(), "    alex: \"secret\"\n"),
@@ -155,4 +226,92 @@ func TestTheListenAddressIsChecked(t *testing.T) {
 	if _, err := New(path); err == nil {
 		t.Fatal("want an error for a listen address without a port")
 	}
+}
+
+// slowProbe measures one folder slowly, so that the daemon can be stopped
+// while its startup scan is walking.
+type slowProbe struct {
+	slow  string
+	delay time.Duration
+	devs  map[string]uint64
+}
+
+func (p slowProbe) VolumeOf(path string) (disk.Volume, error) {
+	if path == p.slow {
+		time.Sleep(p.delay)
+	}
+	return disk.Volume{Dev: p.devs[path], Free: 1 << 30, Total: 10 << 30}, nil
+}
+
+// The daemon is stopped while its startup scan is walking. The scan is
+// cancelled, and it must not leave a plan behind: the folders it did not
+// reach would look like full disks, and the plan would be built from half
+// the data.
+func TestTheStopDuringTheFirstScanLeavesNoPlan(t *testing.T) {
+	root := t.TempDir()
+	// The folders are measured in the order of their paths: a-src first,
+	// then b-dst, and c-src is never reached.
+	src := filepath.Join(root, "a-src")
+	dst := filepath.Join(root, "b-dst")
+	third := filepath.Join(root, "c-src")
+	for _, dir := range []string{src, dst, third} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(root, "state")
+	path := writeConfig(t, fmt.Sprintf(`
+log:
+  level: error
+server:
+  listen: "127.0.0.1:0"
+scan:
+  schedule: "@every 1h"
+  min_age: "0s"
+state:
+  dir: %q
+web:
+  users:
+    alex: "secret"
+folders:
+  %s:
+    dir_type: src
+    type: 2
+    min_free: 900TB
+  %s:
+    dir_type: dst
+    type: 2
+  %s:
+    dir_type: src
+    type: 2
+    min_free: 900TB
+`, stateDir, src, dst, third))
+
+	probe := slowProbe{slow: dst, delay: 2 * time.Second,
+		devs: map[string]uint64{src: 1, dst: 2, third: 3}}
+	daemon, err := New(path, WithProbe(probe))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := daemon.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// The startup scan is walking the destination folder. Stop the daemon.
+	time.Sleep(300 * time.Millisecond)
+	if err := daemon.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	// The measurement is half done, so there is no plan to keep.
+	body, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read the state file: %v", err)
+		}
+		return
+	}
+	t.Fatalf("the interrupted scan left a plan behind: %s", body)
 }

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -63,16 +64,17 @@ type planView struct {
 }
 
 type moveRow struct {
+	CanRemove   bool
 	ID          int
 	Name        string
 	Size        string
+	Copied      string
 	Src         string
 	Dst         string
 	Status      string
 	Attempt     int
 	Error       string
 	CanRollback bool
-	CanRemove   bool
 }
 
 type historyRow struct {
@@ -130,24 +132,26 @@ func (s *Server) buildView(r *http.Request, withHistory bool) view {
 			})
 		}
 		for _, move := range plan.Moves {
-			result.Plan.Rows = append(result.Plan.Rows, moveRow{
-				ID:      move.ID,
-				Name:    move.Name,
-				Size:    format.Bytes(move.Size),
-				Src:     move.Src,
-				Dst:     move.Dst,
-				Status:  moveStatusText(move.Status),
-				Attempt: move.Attempt,
-				Error:   move.Error,
-				// Only a finished move can be put back, and only while
-				// nothing else is running.
-				CanRollback: move.Status == scheduler.StatusDone &&
-					(state == scheduler.StateDone || state == scheduler.StateFailed),
-				// Only a move that has not been started can be taken out of
-				// the plan, and only while the plan waits for an approval.
-				CanRemove: move.Status == scheduler.StatusPending &&
-					state == scheduler.StatePending,
-			})
+			row := moveRow{
+				CanRemove: state == scheduler.StatePending,
+				ID:        move.ID,
+				Name:      move.Name,
+				Size:      format.Bytes(move.Size),
+				Src:       move.Src,
+				Dst:       move.Dst,
+				Status:    moveStatusText(move.Status),
+				Attempt:   move.Attempt,
+				Error:     move.Error,
+			}
+			if move.Status == scheduler.StatusMoving {
+				// The progress is only interesting while the copy runs.
+				row.Copied = format.Bytes(move.Copied)
+			}
+			// Only a finished move can be put back, and only while
+			// nothing else is running.
+			row.CanRollback = move.Status == scheduler.StatusDone &&
+				(state == scheduler.StateDone || state == scheduler.StateFailed)
+			result.Plan.Rows = append(result.Plan.Rows, row)
 		}
 	} else {
 		// The folders have not been measured yet, so their free space is
@@ -259,10 +263,18 @@ func moveStatusText(status string) string {
 }
 
 // formInt reads a number from the form.
-func formInt(r *http.Request, name string) int {
-	value, err := strconv.Atoi(r.PostFormValue(name))
-	if err != nil {
-		return 0
+//
+// A number that cannot be read is an error and not a zero: a zero means
+// "all" in some of the calls, and a typo in the field must not turn into
+// "do everything".
+func formInt(r *http.Request, name string) (int, error) {
+	value := r.PostFormValue(name)
+	if value == "" {
+		return 0, fmt.Errorf("%s: want a number, got nothing", name)
 	}
-	return value
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s: want a number, got %q", name, value)
+	}
+	return number, nil
 }

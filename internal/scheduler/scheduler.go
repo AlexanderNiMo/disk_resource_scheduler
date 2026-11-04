@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
@@ -67,10 +68,10 @@ var (
 	ErrNotScanned = errors.New("the folders have not been scanned yet")
 	// ErrNothingToApprove means the plan has no moves in it.
 	ErrNothingToApprove = errors.New("there is nothing to approve")
-	// ErrNoSuchMove means the plan has no move with that id.
-	ErrNoSuchMove = errors.New("there is no such move in the plan")
-	// ErrNotPending means the move has already been started.
-	ErrNotPending = errors.New("the move has already been started")
+	// ErrScanRunning means a scan is already in flight.
+	ErrScanRunning = errors.New("a scan is already running")
+	// ErrStopping means the daemon is going away.
+	ErrStopping = errors.New("the daemon is stopping")
 )
 
 // Plan is what the daemon proposes to do.
@@ -129,6 +130,13 @@ type ScanStatus struct {
 	Total int
 }
 
+type rollbackState struct {
+	Plan     *Plan `json:"plan"`
+	Targets  []int `json:"targets"`
+	Previous State `json:"previous"`
+	Current  bool  `json:"current"`
+}
+
 // Scheduler plans the moves and performs them.
 type Scheduler struct {
 	cfg     *config.Store
@@ -143,7 +151,8 @@ type Scheduler struct {
 	next int
 	// dirty counts the changes of the moves that are not in the state file
 	// yet.
-	dirty int
+	dirty          int
+	activeRollback *rollbackState
 	// epoch counts the changes that make a measurement stale: an approval,
 	// a rejection, a rollback. A scan that started before such a change
 	// throws its result away.
@@ -155,10 +164,20 @@ type Scheduler struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
+	// stopping tells whether the daemon is shutting down. A task that is
+	// started after that is not started at all: Stop waits for the
+	// WaitGroup, and adding to it after that wait has begun is a misuse
+	// the runtime panics about.
+	stopping bool
+	// scanActive tells whether a scan is in flight. A second request
+	// while one is running is refused instead of queued: twenty clicks on
+	// "Scan" must not mean twenty walks of the library.
+	scanActive atomic.Bool
 }
 
 // New builds a scheduler.
 func New(cfg *config.Store, log *slog.Logger, probe disk.Probe, store *StateStore, history *History) *Scheduler {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Scheduler{
 		cfg:     cfg,
 		log:     log,
@@ -166,44 +185,105 @@ func New(cfg *config.Store, log *slog.Logger, probe disk.Probe, store *StateStor
 		store:   store,
 		history: history,
 		st:      StateIdle,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
 // Start restores the plan from the state file and resumes an interrupted
 // execution.
+//
+// The context it is given is the daemon's lifetime: everything the scheduler
+// starts in the background runs on it, so a stop cancels it.
 func (s *Scheduler) Start(ctx context.Context) error {
 	base, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
+	old := s.cancel
 	s.ctx, s.cancel = base, cancel
 	s.mu.Unlock()
+	if old != nil {
+		old()
+	}
 
 	// The leftovers of the copies that were cut in the middle are thrown
 	// away first: they are the daemon's own files, they are in the way and
 	// nothing else would free the space they take.
 	s.cleanPartials(s.cfg.Load())
 
-	st, plan, err := s.store.Load()
+	stored, err := s.store.load()
+	st, plan := State(stored.State), stored.Plan
 	if err != nil {
 		s.log.Warn("could not read the state file, starting empty", "error", err)
-	} else if plan != nil {
+	} else if plan != nil || stored.Rollback != nil {
 		s.mu.Lock()
-		s.st, s.plan, s.next = st, plan, plan.ID
+		s.st, s.plan = st, plan
+		if plan != nil {
+			s.next = plan.ID
+		}
+		if stored.Rollback != nil && stored.Rollback.Plan.ID > s.next {
+			s.next = stored.Rollback.Plan.ID
+		}
+		s.activeRollback = stored.Rollback
+		if st == StateRollingBack && stored.Rollback == nil {
+			s.st = StateFailed
+			s.log.Warn("the interrupted rollback has no recovery record; automatic recovery is unavailable")
+		}
 		s.scan.Scanned = true
 		s.mu.Unlock()
-		s.log.Info("restored the plan", "state", st, "plan_id", plan.ID)
+		s.log.Info("restored the plan", "state", st)
 
-		if st == StateRunning {
+		if st == StateRollingBack && stored.Rollback != nil {
+			op := stored.Rollback
+			if op.Current {
+				op.Plan = plan
+			}
+			s.run(func() { s.rollback(op.Plan, op.Targets, op.Current, op.Previous, true) })
+		}
+		if st == StateRunning && plan != nil {
 			s.log.Info("resuming the interrupted execution", "plan_id", plan.ID)
 			s.run(func() { s.execute(plan, true) })
 		}
+	}
+
+	// The plan numbers must not collide with the ones in the history: the
+	// history keeps the plans the state file has already forgotten, and a
+	// rollback looks the plan up by its number.
+	if last := s.lastHistoryID(); last > s.next {
+		s.mu.Lock()
+		s.next = last
+		s.mu.Unlock()
+		s.log.Info("the plan numbers continue after the history", "last_plan_id", last)
 	}
 
 	// The folders are measured right away: the daemon should not sit idle
 	// until the first tick of the cron, and there is no plan to make before
 	// the folders are known. A restored plan is not replaced: the scan skips
 	// itself while a plan waits for an approval.
-	s.run(func() { s.Scan(base) })
+	//
+	// The scan runs on the daemon's own context, so a stop cancels it and
+	// the daemon waits for it.
+	if err := s.StartScan(); err != nil {
+		s.log.Error("the first scan could not be started", "error", err)
+	}
 	return nil
+}
+
+// lastHistoryID returns the number of the last plan in the history.
+//
+// It is zero when there is no history or it cannot be read.
+func (s *Scheduler) lastHistoryID() int {
+	entries, err := s.history.List()
+	if err != nil {
+		s.log.Warn("could not read the history", "error", err)
+		return 0
+	}
+	last := 0
+	for _, entry := range entries {
+		if entry.ID > last {
+			last = entry.ID
+		}
+	}
+	return last
 }
 
 // cleanPartials removes the leftovers of the copies that were cut in the
@@ -233,10 +313,15 @@ func (s *Scheduler) cleanPartials(cfg *config.Config) {
 }
 
 // Stop cancels a running execution and waits for it.
+//
+// Nothing new is started after this: the tasks that are already running
+// are given the time to finish, and the daemon goes away when they are
+// done.
 func (s *Scheduler) Stop(ctx context.Context) error {
-	s.mu.RLock()
+	s.mu.Lock()
+	s.stopping = true
 	cancel := s.cancel
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -255,6 +340,10 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 }
 
 // Scan measures the folders and publishes a new plan.
+//
+// A scan that is cancelled publishes nothing: the folders that were not
+// measured would look like full disks, and a plan built from half the data
+// is worse than no plan at all.
 func (s *Scheduler) Scan(ctx context.Context) error {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
@@ -288,6 +377,14 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 
 	s.log.Info("the scan is started", "folders", len(cfg.Folders))
 	measured := s.gather(ctx, cfg)
+
+	if ctx.Err() != nil {
+		// The scan was cancelled: half the folders are measured and half
+		// are not. A plan made of that would move files the daemon did not
+		// mean to move, so nothing is published.
+		s.log.Info("the scan was cancelled, the measurement is thrown away")
+		return ctx.Err()
+	}
 
 	s.mu.Lock()
 	if s.epoch != epoch {
@@ -328,6 +425,35 @@ func (s *Scheduler) Scan(ctx context.Context) error {
 	return s.save()
 }
 
+// StartScan starts a scan in the background and returns at once.
+//
+// The scan runs on the daemon's own context: it is cancelled when the
+// daemon stops, and the daemon waits for it before it goes away.
+//
+// Only one scan runs at a time. A second request while a scan is in
+// flight is refused, so that twenty clicks on the button do not mean
+// twenty walks of the library.
+func (s *Scheduler) StartScan() error {
+	if !s.scanActive.CompareAndSwap(false, true) {
+		return ErrScanRunning
+	}
+
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+
+	if !s.run(func() {
+		defer s.scanActive.Store(false)
+		if err := s.Scan(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			s.log.Error("the scan failed", "error", err)
+		}
+	}) {
+		s.scanActive.Store(false)
+		return ErrStopping
+	}
+	return nil
+}
+
 // Approve starts the execution of the current plan.
 func (s *Scheduler) Approve(planID int) error {
 	s.mu.Lock()
@@ -351,14 +477,67 @@ func (s *Scheduler) Approve(planID int) error {
 		s.mu.Unlock()
 		return ErrBusy
 	}
+	if s.st != StatePending {
+		// The plan is not waiting for an approval: it was already done,
+		// or it was rejected. Approving it again would write a second
+		// entry into the history for the same plan.
+		s.mu.Unlock()
+		return ErrStalePlan
+	}
 	plan := s.plan
+	if !s.reserveLocked() {
+		s.mu.Unlock()
+		return ErrStopping
+	}
+	if err := s.store.Save(StateRunning, copyPlan(plan)); err != nil {
+		s.wg.Done()
+		s.mu.Unlock()
+		return err
+	}
 	s.st = StateRunning
 	s.epoch++
 	s.mu.Unlock()
-
-	s.save()
-	s.run(func() { s.execute(plan, false) })
+	s.start(func() { s.execute(plan, false) })
 	return nil
+}
+
+// Remove excludes one move from a plan that is waiting for approval.
+func (s *Scheduler) Remove(planID, moveID int) error {
+	s.mu.Lock()
+	if !s.scan.Scanned {
+		s.mu.Unlock()
+		return ErrNotScanned
+	}
+	if s.plan == nil {
+		s.mu.Unlock()
+		return ErrNoPlan
+	}
+	if s.plan.ID != planID {
+		s.mu.Unlock()
+		return ErrStalePlan
+	}
+	if s.st == StateRunning || s.st == StateRollingBack {
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	if s.st != StatePending {
+		s.mu.Unlock()
+		return ErrStalePlan
+	}
+	for i, move := range s.plan.Moves {
+		if move.ID != moveID {
+			continue
+		}
+		s.plan.Moves = append(s.plan.Moves[:i], s.plan.Moves[i+1:]...)
+		if len(s.plan.Moves) == 0 {
+			s.st = StateIdle
+		}
+		s.epoch++
+		s.mu.Unlock()
+		return s.save()
+	}
+	s.mu.Unlock()
+	return fmt.Errorf("there is no move #%d", moveID)
 }
 
 // Reject discards the current plan.
@@ -376,6 +555,14 @@ func (s *Scheduler) Reject(planID int) error {
 		s.mu.Unlock()
 		return ErrStalePlan
 	}
+	if s.st == StateRunning || s.st == StateRollingBack {
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	if s.st != StatePending {
+		s.mu.Unlock()
+		return ErrStalePlan
+	}
 	plan := s.plan
 	s.plan = nil
 	s.st = StateIdle
@@ -386,55 +573,6 @@ func (s *Scheduler) Reject(planID int) error {
 	return s.save()
 }
 
-// Remove takes one file out of the plan.
-//
-// The file stays where it is: it is not moved, and the plan is approved
-// without it.
-func (s *Scheduler) Remove(planID, moveID int) error {
-	s.mu.Lock()
-	if s.plan == nil {
-		s.mu.Unlock()
-		return ErrNoPlan
-	}
-	if s.plan.ID != planID {
-		s.mu.Unlock()
-		return ErrStalePlan
-	}
-	if s.st == StateRunning || s.st == StateRollingBack {
-		// The executor walks the moves of the plan: taking one out from
-		// under it would move the wrong file.
-		s.mu.Unlock()
-		return ErrBusy
-	}
-	index := -1
-	for i := range s.plan.Moves {
-		if s.plan.Moves[i].ID == moveID {
-			index = i
-			break
-		}
-	}
-	if index < 0 {
-		s.mu.Unlock()
-		return ErrNoSuchMove
-	}
-	if s.plan.Moves[index].Status != StatusPending {
-		// The move has already been started: the file is not where the plan
-		// says it is.
-		s.mu.Unlock()
-		return ErrNotPending
-	}
-	s.plan.Moves = append(s.plan.Moves[:index], s.plan.Moves[index+1:]...)
-	if len(s.plan.Moves) == 0 {
-		// There is nothing to approve any more, and a plan that waits for an
-		// approval stops the next scan.
-		s.st = StateIdle
-	}
-	s.mu.Unlock()
-
-	s.log.Info("the file is taken out of the plan", "plan_id", planID, "move_id", moveID)
-	return s.save()
-}
-
 // Rollback puts one move back where it came from, or all of them when moveID
 // is zero.
 //
@@ -442,18 +580,17 @@ func (s *Scheduler) Remove(planID, moveID int) error {
 // that runs after the execution replaces the current plan, and the files
 // that were moved are still worth putting back.
 func (s *Scheduler) Rollback(planID, moveID int) error {
-	s.mu.Lock()
+	s.mu.RLock()
 	if !s.scan.Scanned {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return ErrNotScanned
 	}
 	if s.st == StateRunning || s.st == StateRollingBack {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return ErrBusy
 	}
 	current := s.plan
-	previous := s.st
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	plan := current
 	if plan == nil || plan.ID != planID {
@@ -463,6 +600,10 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 		return fmt.Errorf("there is no plan #%d", planID)
 	}
 
+	// The statuses are read under the lock: the executor writes them
+	// while it moves the files, and it writes them into this very plan
+	// when it is the current one.
+	s.mu.RLock()
 	var targets []int
 	for i := range plan.Moves {
 		move := plan.Moves[i]
@@ -474,20 +615,39 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 		}
 		targets = append(targets, i)
 	}
+	s.mu.RUnlock()
 	if len(targets) == 0 {
 		return fmt.Errorf("there is nothing to roll back")
 	}
 	// The last thing moved goes back first.
 	sort.Slice(targets, func(i, j int) bool { return targets[i] > targets[j] })
 
-	isCurrent := current != nil && current.ID == planID
+	// The state is checked and set in one go. An approval that came in
+	// between the two would start the execution, and the rollback would
+	// then move the same files at the same time.
 	s.mu.Lock()
+	if s.st == StateRunning || s.st == StateRollingBack {
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	if !s.reserveLocked() {
+		s.mu.Unlock()
+		return ErrStopping
+	}
+	isCurrent := s.plan != nil && s.plan.ID == planID
+	previous := s.st
+	op := &rollbackState{Plan: copyPlan(plan), Targets: targets, Current: isCurrent, Previous: previous}
+	if err := s.store.Save(StateRollingBack, copyPlan(s.plan), op); err != nil {
+		s.wg.Done()
+		s.mu.Unlock()
+		return err
+	}
+	op.Plan = plan
+	s.activeRollback = op
 	s.st = StateRollingBack
 	s.epoch++
 	s.mu.Unlock()
-
-	s.save()
-	s.run(func() { s.rollback(plan, targets, isCurrent, previous) })
+	s.start(func() { s.rollback(plan, targets, isCurrent, previous, false) })
 	return nil
 }
 
@@ -644,26 +804,42 @@ func (s *Scheduler) execute(plan *Plan, resume bool) {
 		if resume {
 			// The files say what happened, not the saved status: it can be
 			// up to a hundred moves behind.
-			_, sourceErr := os.Stat(move.Path)
-			_, destErr := os.Stat(move.DstPath)
+			_, sourceErr := os.Lstat(move.Path)
+			_, destErr := os.Lstat(move.DstPath)
 			switch {
-			case sourceErr != nil && destErr == nil:
+			case errors.Is(sourceErr, os.ErrNotExist) && destErr == nil:
 				// The copy finished before the crash; only the status was
 				// not saved.
 				s.setMove(plan, i, StatusDone, "")
+				continue
+			case sourceErr == nil && destErr == nil:
+				s.setMove(plan, i, StatusFailed, "и источник, и приёмник на месте")
 				continue
 			case sourceErr != nil:
 				s.setMove(plan, i, StatusFailed, "источника нет на месте")
 				continue
 			}
 		}
+
+		// The plan may have waited for an approval for hours, and the file
+		// may have been written again since: a download that started over.
+		// Moving it now would move half a file and delete the original.
+		if s.changedRecently(move.Path) {
+			s.setMove(plan, i, StatusFailed, "файл изменился после составления плана")
+			continue
+		}
+
 		s.transfer(plan, i, move.Path, move.DstPath, StatusDone)
+		if s.stopped() {
+			s.save()
+			return
+		}
 	}
 	s.finish(plan, "plan")
 }
 
 // rollback puts the given moves back where they came from.
-func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous State) {
+func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous State, resume bool) {
 	for _, i := range targets {
 		if s.stopped() {
 			s.log.Warn("the rollback was stopped, the rest stays as it is")
@@ -676,6 +852,17 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 		s.mu.RLock()
 		move := plan.Moves[i]
 		s.mu.RUnlock()
+
+		if move.Status == StatusRolledBack {
+			continue
+		}
+		// A rename may have finished before its status reached the state file.
+		_, fromErr := os.Lstat(move.DstPath)
+		_, toErr := os.Lstat(move.Path)
+		if resume && errors.Is(fromErr, os.ErrNotExist) && toErr == nil {
+			s.setMove(plan, i, StatusRolledBack, "")
+			continue
+		}
 
 		if err := s.stillConfigured(move); err != nil {
 			s.setMove(plan, i, StatusFailed, err.Error())
@@ -690,6 +877,10 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 			continue
 		}
 		s.transfer(plan, i, move.DstPath, move.Path, StatusRolledBack)
+		if s.stopped() {
+			s.save()
+			return
+		}
 	}
 
 	s.mu.RLock()
@@ -706,7 +897,9 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 		st = StateFailed
 	}
 
+	s.appendHistory(plan, "rollback", st, time.Now())
 	s.mu.Lock()
+	s.activeRollback = nil
 	if isCurrent {
 		s.st = st
 	} else {
@@ -717,7 +910,6 @@ func (s *Scheduler) rollback(plan *Plan, targets []int, isCurrent bool, previous
 	s.mu.Unlock()
 
 	s.save()
-	s.appendHistory(plan, "rollback", st, time.Now())
 }
 
 // transfer moves one entry and records the outcome.
@@ -756,10 +948,30 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, okStatus st
 			s.setMove(plan, index, okStatus, "")
 			return
 		}
-		lastErr = err
+		if errors.Is(err, disk.ErrSourceNotRemoved) {
+			// The copy is in place and whole; only the source is left
+			// behind. The move succeeded, and a retry would find the
+			// destination taken.
+			s.log.Warn("the entry is moved, but the source is left behind",
+				"from", from, "to", to, "attempt", attempt, "error", err)
+			s.setMove(plan, index, okStatus, "источник не удалился")
+			return
+		}
+		// The first error is the one that says what is wrong: the later
+		// attempts fail because of it, and their messages point at the
+		// wrong thing.
+		if lastErr == nil {
+			lastErr = err
+		}
 		s.log.Warn("the move failed", "from", from, "to", to, "attempt", attempt, "error", err)
 		if attempt < moveAttempts {
-			time.Sleep(retryPause)
+			// The pause ends right away when the daemon is stopping: there
+			// is no point in trying again when nobody is waiting.
+			select {
+			case <-time.After(retryPause):
+			case <-s.daemonCtx().Done():
+				return
+			}
 		}
 	}
 	s.setMove(plan, index, StatusFailed, lastErr.Error())
@@ -783,6 +995,19 @@ func (s *Scheduler) stillConfigured(move Move) error {
 	return nil
 }
 
+// changedRecently tells whether the file was changed within min_age.
+//
+// A file that is written right now is not media yet: it is being downloaded
+// or unpacked. Moving it would move half a file and delete the original.
+func (s *Scheduler) changedRecently(path string) bool {
+	minAge := time.Duration(s.cfg.Load().Scan.MinAge)
+	if minAge <= 0 {
+		return false
+	}
+	newest, err := disk.ModTime(path)
+	return err != nil || newest.After(time.Now().Add(-minAge))
+}
+
 // finish closes a plan and puts it into the history.
 func (s *Scheduler) finish(plan *Plan, kind string) {
 	s.mu.RLock()
@@ -798,16 +1023,51 @@ func (s *Scheduler) finish(plan *Plan, kind string) {
 	if failed {
 		st = StateFailed
 	}
+
+	// The history is written before the state says the plan is done: a
+	// reader that sees "done" must see the plan in the history too.
+	s.appendHistory(plan, kind, st, time.Now())
+
 	s.mu.Lock()
 	s.st = st
 	s.mu.Unlock()
 
 	s.save()
-	s.appendHistory(plan, kind, st, time.Now())
 }
 
-func (s *Scheduler) run(fn func()) {
+// run starts a task in the background and waits for it when the daemon
+// stops.
+//
+// A task that is started after the shutdown has begun is not started at
+// all: the WaitGroup is waited for by Stop, and adding to it after that
+// wait has begun is a misuse the runtime panics about.
+func (s *Scheduler) run(fn func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.reserveLocked() {
+		return false
+	}
+	s.start(fn)
+	return true
+}
+
+// reserveLocked takes a slot in the WaitGroup for a task that is about to
+// start. It returns false when the daemon is stopping.
+//
+// The slot is taken while the lock is held, so that it can never be taken
+// after Stop has begun to wait: the runtime panics about that.
+//
+// The caller must hold s.mu.
+func (s *Scheduler) reserveLocked() bool {
+	if s.stopping {
+		return false
+	}
 	s.wg.Add(1)
+	return true
+}
+
+// start runs a task in a slot that was reserved with reserveLocked.
+func (s *Scheduler) start(fn func()) {
 	go func() {
 		defer s.wg.Done()
 		fn()
@@ -816,10 +1076,18 @@ func (s *Scheduler) run(fn func()) {
 
 // stopped reports whether the daemon is shutting down.
 func (s *Scheduler) stopped() bool {
+	return s.daemonCtx().Err() != nil
+}
+
+// daemonCtx returns the context of the daemon's lifetime.
+func (s *Scheduler) daemonCtx() context.Context {
 	s.mu.RLock()
 	ctx := s.ctx
 	s.mu.RUnlock()
-	return ctx != nil && ctx.Err() != nil
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (s *Scheduler) setMove(plan *Plan, index int, status, message string) {
@@ -827,8 +1095,10 @@ func (s *Scheduler) setMove(plan *Plan, index int, status, message string) {
 	plan.Moves[index].Status = status
 	plan.Moves[index].Error = message
 	s.dirty++
-	write := s.dirty >= saveEveryMoves ||
-		status == StatusDone || status == StatusFailed || status == StatusRolledBack
+	// The state file holds the whole plan, so writing it after every move
+	// would rewrite hundreds of kilobytes for every move. It is written
+	// every hundred changes instead, and once more when the plan is done.
+	write := s.dirty >= saveEveryMoves
 	if write {
 		s.dirty = 0
 	}
@@ -859,14 +1129,20 @@ func (s *Scheduler) appendHistory(plan *Plan, kind string, st State, at time.Tim
 	s.mu.RUnlock()
 
 	entry := HistoryEntry{
-		ID:         copied.ID,
-		Kind:       kind,
-		CreatedAt:  at,
-		State:      string(st),
-		MovesCount: len(copied.Moves),
-		Plan:       copied,
+		ID:        copied.ID,
+		Kind:      kind,
+		CreatedAt: at,
+		State:     string(st),
+		Plan:      copied,
 	}
+	// Only the moves that were really made are counted: a plan that was
+	// rejected moved nothing, and a plan that failed halfway moved a part
+	// of what it said.
 	for _, move := range copied.Moves {
+		if move.Status != StatusDone && move.Status != StatusRolledBack {
+			continue
+		}
+		entry.MovesCount++
 		entry.Bytes += move.Size
 	}
 	if err := s.history.Append(entry); err != nil {
@@ -876,11 +1152,17 @@ func (s *Scheduler) appendHistory(plan *Plan, kind string, st State, at time.Tim
 
 func (s *Scheduler) save() error {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	st := s.st
 	plan := copyPlan(s.plan)
-	s.mu.RUnlock()
+	var op *rollbackState
+	if s.activeRollback != nil {
+		copied := *s.activeRollback
+		copied.Plan = copyPlan(copied.Plan)
+		op = &copied
+	}
 
-	if err := s.store.Save(st, plan); err != nil {
+	if err := s.store.Save(st, plan, op); err != nil {
 		s.log.Warn("could not write the state file", "error", err)
 		return err
 	}

@@ -1,7 +1,9 @@
 package web
 
 import (
-	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -60,30 +62,77 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 // The history is not in the fragment, so it is not read: the file holds
 // every plan ever made, and reading it every few seconds would cost more
 // than the rest of the page.
+//
+// The fragment is only sent when it really changed. Every poll throws the
+// buttons away and makes them again, and a click that begins on the old
+// button and ends on the new one does nothing at all.
 func (s *Server) handlePlanFragment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	s.renderFragment(w, r, "plan_block", s.buildView(r, false))
+	body, err := s.fragmentBytes("plan_block", s.buildView(r, false))
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !s.fragmentChanged(r, body) {
+		// Nothing changed: the browser keeps what it has.
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+// fragmentChanged tells whether the fragment is different from the one this
+// browser was given last time, and remembers it.
+//
+// The plan block carries the csrf token, so the fragment is different for
+// every browser: the comparison is per browser and not for the daemon.
+func (s *Server) fragmentChanged(r *http.Request, body []byte) bool {
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	token, _ := r.Context().Value(ctxSession).(string)
+	if token == "" {
+		return true
+	}
+	found, ok := s.tokens[token]
+	if !ok {
+		return true
+	}
+	if found.fragment == digest {
+		return false
+	}
+	found.fragment = digest
+	s.tokens[token] = found
+	return true
 }
 
 // handleScan starts a scan.
 //
 // The scan walks the library, which takes a while, so it runs in the
 // background: the page shows the plan as soon as it is ready.
+//
+// A scan that is already running is not started again: the library would
+// be walked twice for nothing.
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
-	go func() {
-		// The context of the request is cancelled when the request ends,
-		// and the scan would stop at the first folder. It runs on the
-		// context of the daemon instead.
-		if err := s.sch.Scan(context.Background()); err != nil {
-			s.log.Error("the scan failed", "error", err)
-		}
-	}()
+	if err := s.sch.StartScan(); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	s.answer(w, r, http.StatusAccepted, map[string]string{"status": "scanning"})
 }
 
 // handleApprove starts the execution of the plan.
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Approve(formInt(r, "plan_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if err := s.sch.Approve(planID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -92,7 +141,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 
 // handleReject throws the plan away.
 func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Reject(formInt(r, "plan_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if err := s.sch.Reject(planID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -101,7 +155,21 @@ func (s *Server) handleReject(w http.ResponseWriter, r *http.Request) {
 
 // handleRemove takes one file out of the plan: it stays where it is.
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Remove(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	moveID, err := formInt(r, "move_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if moveID <= 0 {
+		s.badRequest(w, r, fmt.Errorf("move_id: want a positive number, got %d", moveID))
+		return
+	}
+	if err := s.sch.Remove(planID, moveID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -110,7 +178,21 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 
 // handleRollback puts one move back, or all of them when move_id is zero.
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
-	if err := s.sch.Rollback(formInt(r, "plan_id"), formInt(r, "move_id")); err != nil {
+	planID, err := formInt(r, "plan_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	moveID, err := formInt(r, "move_id")
+	if err != nil {
+		s.badRequest(w, r, err)
+		return
+	}
+	if moveID < 0 {
+		s.badRequest(w, r, fmt.Errorf("move_id: want zero or a number, got %d", moveID))
+		return
+	}
+	if err := s.sch.Rollback(planID, moveID); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -131,6 +213,20 @@ func (s *Server) answer(w http.ResponseWriter, r *http.Request, status int, payl
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if isAPI(r) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	view := s.buildView(r, true)
+	view.Error = err.Error()
+	s.render(w, r, "dashboard", view)
+}
+
+// badRequest reports a form that cannot be read.
+//
+// It is a different answer from fail: the request was never understood,
+// so it is not a conflict with what the daemon is doing.
+func (s *Server) badRequest(w http.ResponseWriter, r *http.Request, err error) {
+	if isAPI(r) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	view := s.buildView(r, true)

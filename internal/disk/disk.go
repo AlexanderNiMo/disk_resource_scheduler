@@ -155,3 +155,16 @@ func treeStat(path string) (int64, time.Time, error) {
 	}
 	return size, newest, nil
 }
+
+// ModTime returns the newest modification time in an entry, including its children.
+func ModTime(path string) (time.Time, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if info.IsDir() {
+		_, newest, err := treeStat(path)
+		return newest, err
+	}
+	return info.ModTime(), nil
+}

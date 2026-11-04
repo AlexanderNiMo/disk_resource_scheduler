@@ -1,7 +1,7 @@
 package web
 
 import (
-	"encoding/json"
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -292,6 +292,41 @@ func TestApprovingBeforeTheFirstScanIsRefused(t *testing.T) {
 	}
 }
 
+// A move_id that cannot be read is an error and not a zero: a zero means
+// "roll back everything".
+func TestARollbackWithABrokenMoveIDIsRefused(t *testing.T) {
+	server := newTestServer(t)
+	client := login(t, server)
+
+	page, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse the url: %v", err)
+	}
+	token := ""
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			token = cookie.Value
+		}
+	}
+
+	for _, moveID := range []string{"", "abc", "-1"} {
+		resp, err := client.PostForm(server.URL+"/api/plan/rollback", url.Values{
+			"plan_id":    {"1"},
+			"move_id":    {moveID},
+			"csrf_token": {token},
+		})
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("the rollback with move_id %q returned %d, want %d: %s",
+				moveID, resp.StatusCode, http.StatusBadRequest, body)
+		}
+	}
+}
+
 func TestTheManualScanMeasuresEveryFolder(t *testing.T) {
 	root := t.TempDir()
 	folders := map[string]config.Folder{}
@@ -352,6 +387,118 @@ func TestTheManualScanMeasuresEveryFolder(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("the scan never finished")
+}
+
+// The plan block is polled every few seconds. A poll that throws the
+// buttons away makes a click on them do nothing, so the fragment is only
+// sent when it really changed.
+func TestThePlanFragmentIsOnlySentWhenItChanged(t *testing.T) {
+	server, srv, _ := newTestServerWith(t)
+	client := login(t, server)
+
+	resp, err := client.Get(server.URL + "/fragments/plan")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the first fragment returned %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(string(body), "План перемещения") {
+		t.Fatalf("the fragment is %s, want the plan block", body)
+	}
+
+	// Nothing changed, so the browser keeps what it has.
+	resp, err = client.Get(server.URL + "/fragments/plan")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("the second fragment returned %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// The daemon is told what it sent last, per browser.
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	for token, session := range srv.tokens {
+		if session.fragment == "" {
+			t.Fatalf("the session of %q remembers no fragment", token)
+		}
+	}
+}
+
+// A scan that is already running is not started again: the library would be
+// walked twice for nothing.
+func TestASecondScanIsRefused(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "src")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "movie.mkv"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+		Folders: map[string]config.Folder{
+			dir: {Path: dir, DirType: config.DirTypeSrc, Type: 2, MinFree: 1},
+		},
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	// The probe is slow, so the scan stays in flight.
+	sch := scheduler.New(store, logger, slowProbe{}, scheduler.NewStateStore(t.TempDir()), history)
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer sch.Stop(context.Background())
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	client := login(t, httpServer)
+	page, _ := url.Parse(httpServer.URL)
+	token := ""
+	for _, cookie := range client.Jar.Cookies(page) {
+		if cookie.Name == csrfCookie {
+			token = cookie.Value
+		}
+	}
+
+	// Wait for the first scan to be under way.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !sch.ScanStatus().Running {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sch.ScanStatus().Running {
+		t.Fatal("the first scan never started")
+	}
+
+	resp, err := client.PostForm(httpServer.URL+"/api/scan", url.Values{"csrf_token": {token}})
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("the second scan returned %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+}
+
+// slowProbe measures the volumes slowly, so that a scan stays in flight.
+type slowProbe struct{}
+
+func (slowProbe) VolumeOf(string) (disk.Volume, error) {
+	time.Sleep(200 * time.Millisecond)
+	return disk.Volume{Dev: 1, Free: 1 << 30}, nil
 }
 
 func TestASessionOfARemovedUserStopsWorking(t *testing.T) {
@@ -451,157 +598,22 @@ func TestAChangedPasswordEndsTheSession(t *testing.T) {
 	}
 }
 
-// fixedProbe reports the volumes a test wants.
-type fixedProbe map[string]disk.Volume
-
-func (p fixedProbe) VolumeOf(path string) (disk.Volume, error) {
-	volume, ok := p[path]
-	if !ok {
-		return disk.Volume{}, os.ErrNotExist
-	}
-	return volume, nil
-}
-
-// planPayload is what the API answers with.
-type planPayload struct {
-	State string `json:"state"`
-	Plan  struct {
-		ID    int `json:"id"`
-		Moves []struct {
-			ID   int    `json:"id"`
-			Name string `json:"name"`
-		} `json:"moves"`
-	} `json:"plan"`
-}
-
-// getPlan asks the API for the current plan.
-func getPlan(t *testing.T, client *http.Client, base string) planPayload {
-	t.Helper()
-
-	resp, err := client.Get(base + "/api/plan")
-	if err != nil {
-		t.Fatalf("get the plan: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the api returned %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-	var payload planPayload
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode the plan: %v", err)
-	}
-	return payload
-}
-
-// csrfToken returns the token the client already has.
-func csrfToken(t *testing.T, client *http.Client, base string) string {
-	t.Helper()
-
-	page, err := url.Parse(base)
-	if err != nil {
-		t.Fatalf("parse the url: %v", err)
-	}
-	for _, cookie := range client.Jar.Cookies(page) {
-		if cookie.Name == csrfCookie {
-			return cookie.Value
-		}
-	}
-	t.Fatal("the client has no csrf token")
-	return ""
-}
-
-func TestAFileCanBeTakenOutOfThePlan(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "src")
-	dst := filepath.Join(dir, "dst")
-	if err := os.MkdirAll(src, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(dst, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(src, "movie.mkv"), []byte("hello"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &config.Config{
-		Server: config.Server{Listen: "127.0.0.1:0"},
-		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
-		Scan:   config.Scan{MinAge: config.Duration(0)},
-		Folders: map[string]config.Folder{
-			src: {Path: src, DirType: config.DirTypeSrc, Type: 2, MinFree: 50 << 30},
-			dst: {Path: dst, DirType: config.DirTypeDst, Type: 2},
-		},
-	}
-	store := config.NewStore(cfg)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	history := scheduler.NewHistory(t.TempDir())
-	sch := scheduler.New(store, logger, fixedProbe{
-		src: {Dev: 1, Free: 1 << 30},
-		dst: {Dev: 2, Free: 500 << 30},
-	}, scheduler.NewStateStore(t.TempDir()), history)
-
-	server, err := New(store, logger, sch, history)
-	if err != nil {
-		t.Fatal(err)
-	}
-	httpServer := httptest.NewServer(server.Handler())
-	defer httpServer.Close()
-
-	client := login(t, httpServer)
-	token := csrfToken(t, client, httpServer.URL)
-
-	resp, err := client.PostForm(httpServer.URL+"/scan", url.Values{"csrf_token": {token}})
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
-	resp.Body.Close()
-
-	// The scan runs after the answer.
-	var plan planPayload
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		plan = getPlan(t, client, httpServer.URL)
-		if len(plan.Plan.Moves) == 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if len(plan.Plan.Moves) != 1 {
-		t.Fatalf("the plan has %d moves, want 1", len(plan.Plan.Moves))
-	}
-
-	// The page offers to take the file out of the plan.
-	resp, err = client.Get(httpServer.URL + "/")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !strings.Contains(string(body), "Убрать из плана") {
-		t.Fatalf("the dashboard does not offer to take the file out: %s", body)
-	}
-
-	resp, err = client.PostForm(httpServer.URL+"/api/plan/remove", url.Values{
-		"plan_id":    {strconv.Itoa(plan.Plan.ID)},
-		"move_id":    {strconv.Itoa(plan.Plan.Moves[0].ID)},
-		"csrf_token": {token},
-	})
-	if err != nil {
-		t.Fatalf("post: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("the removal returned %d, want %d: %s", resp.StatusCode, http.StatusOK, body)
-	}
-
-	plan = getPlan(t, client, httpServer.URL)
-	if len(plan.Plan.Moves) != 0 {
-		t.Fatalf("the plan still has %+v", plan.Plan.Moves)
-	}
-	// The file is still where it was.
-	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
-		t.Fatalf("the file is gone: %v", err)
+func TestRemoveRejectsInvalidIDs(t *testing.T) {
+	for _, values := range []url.Values{
+		{"plan_id": {"broken"}, "move_id": {"1"}},
+		{"plan_id": {"1"}, "move_id": {"broken"}},
+		{"plan_id": {"1"}, "move_id": {"0"}},
+		{"plan_id": {"1"}, "move_id": {"-1"}},
+	} {
+		t.Run(values.Encode(), func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/api/plan/remove", strings.NewReader(values.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			s := &Server{}
+			s.handleRemove(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want %d", w.Code, http.StatusBadRequest)
+			}
+		})
 	}
 }

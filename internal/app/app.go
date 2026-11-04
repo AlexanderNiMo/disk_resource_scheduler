@@ -137,11 +137,17 @@ func (a *App) Stop(ctx context.Context) error {
 		a.cancel()
 	}
 	a.mu.Lock()
-	if a.cron != nil {
-		a.cron.Stop()
-		a.cron = nil
-	}
+	cronStopped := a.cron.Stop()
+	a.cron = nil
 	a.mu.Unlock()
+
+	// The cron job may be in the middle of a scan. Its context is done when
+	// the job returns, and the job waits for the scan it started.
+	select {
+	case <-cronStopped.Done():
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	if a.http != nil {
 		shutdownCtx, cancel := context.WithTimeout(ctx, httpShutdownTimeout)
@@ -166,7 +172,7 @@ func (a *App) Addr() string {
 func (a *App) startCron(expr string) error {
 	c := cron.New()
 	if _, err := c.AddFunc(expr, func() {
-		if err := a.sched.Scan(context.Background()); err != nil {
+		if err := a.sched.StartScan(); err != nil && !errors.Is(err, scheduler.ErrScanRunning) {
 			a.log.Error("the scan failed", "error", err)
 		}
 	}); err != nil {
@@ -189,6 +195,9 @@ func (a *App) watchConfig(ctx context.Context) {
 	defer ticker.Stop()
 
 	stamp := a.configStamp()
+	// The version that could not be read. It is remembered so that a broken
+	// config is not complained about on every tick.
+	failed := ""
 	for {
 		select {
 		case <-ctx.Done():
@@ -198,8 +207,18 @@ func (a *App) watchConfig(ctx context.Context) {
 			if current == stamp {
 				continue
 			}
-			stamp = current
-			a.reload()
+			if a.reload(ctx) {
+				stamp = current
+				failed = ""
+				continue
+			}
+			// The stamp is not moved on: the same version is tried again,
+			// because the file may have been read while it was being
+			// written.
+			if current != failed {
+				failed = current
+				a.log.Warn("the config could not be read, the old one is kept")
+			}
 		}
 	}
 }
@@ -217,16 +236,16 @@ func (a *App) configStamp() string {
 //
 // A config that does not parse leaves the running one alone: a broken file
 // must not take the daemon down.
-func (a *App) reload() {
+//
+// It tells whether the new config is in force.
+func (a *App) reload(ctx context.Context) bool {
 	cfg, err := config.Load(a.cfgPath)
 	if err != nil {
 		a.log.Warn("the config is not usable, keeping the old one", "error", err)
-		return
+		return false
 	}
 
 	old := a.cfg.Load()
-	a.cfg.Store(cfg)
-	a.log.Info("the config was reloaded", "folders", len(cfg.Folders))
 
 	if cfg.Server.Listen != old.Server.Listen {
 		a.log.Warn("the listen address changed, the daemon has to be restarted",
@@ -237,19 +256,38 @@ func (a *App) reload() {
 			"was", old.State.Dir, "now", cfg.State.Dir)
 	}
 
+	// The schedule is checked before the config is put in force: a config
+	// with a schedule that cannot be used would leave the daemon with a
+	// schedule it does not run.
 	if _, err := cron.ParseStandard(cfg.Scan.Schedule); err != nil {
 		a.log.Warn("the new schedule is not usable, keeping the old one", "error", err)
-		return
+		return false
 	}
+
+	a.cfg.Store(cfg)
+	a.log.Info("the config was reloaded", "folders", len(cfg.Folders))
+
 	a.mu.Lock()
+	var oldCron context.Context
 	if a.cron != nil {
-		a.cron.Stop()
+		oldCron = a.cron.Stop()
 		a.cron = nil
 	}
 	a.mu.Unlock()
+	// The old cron may be in the middle of a scan. The new one waits for it,
+	// so that two scans do not walk the library at the same time.
+	if oldCron != nil {
+		select {
+		case <-oldCron.Done():
+		case <-ctx.Done():
+			return false
+		}
+	}
 	if err := a.startCron(cfg.Scan.Schedule); err != nil {
 		a.log.Warn("the new schedule is not usable, keeping the old one", "error", err)
+		return false
 	}
+	return true
 }
 
 // newLogger builds the logger the daemon writes with.

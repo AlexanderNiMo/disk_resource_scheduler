@@ -1,6 +1,8 @@
 package disk
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,6 +71,64 @@ func TestCopyTreeKeepsModeAndTime(t *testing.T) {
 	}
 }
 
+// The umask must not eat the mode: a file that the group can write stays
+// that way after the copy.
+func TestCopyTreeKeepsTheModeOfAGroupWritableFile(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "copy")
+
+	writeFile(t, filepath.Join(src, "movie.mkv"), "abc")
+	if err := os.Chmod(filepath.Join(src, "movie.mkv"), 0o664); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if err := CopyTree(src, dst, nil); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dst, "movie.mkv"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o664 {
+		t.Fatalf("the mode is %o, want 664", info.Mode().Perm())
+	}
+}
+
+// A directory that is read-only still holds files: the copy puts them in
+// and sets the mode at the end.
+func TestCopyTreeOfAReadOnlyDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions")
+	}
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "copy")
+
+	writeFile(t, filepath.Join(src, "Show.S01", "ep01.mkv"), "abc")
+	if err := os.Chmod(filepath.Join(src, "Show.S01"), 0o555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer os.Chmod(filepath.Join(src, "Show.S01"), 0o755)
+
+	if err := CopyTree(src, dst, nil); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	// The copy is read-only, like the source: the test needs to be able to
+	// take it away again.
+	defer os.Chmod(filepath.Join(dst, "Show.S01"), 0o755)
+
+	info, err := os.Stat(filepath.Join(dst, "Show.S01"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o555 {
+		t.Fatalf("the mode is %o, want 555", info.Mode().Perm())
+	}
+	if _, err := os.Stat(filepath.Join(dst, "Show.S01", "ep01.mkv")); err != nil {
+		t.Fatalf("the file is not in the copy: %v", err)
+	}
+}
+
 func TestCopyTreeFailsAndKeepsTheSource(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root writes into a read-only directory")
@@ -87,6 +147,40 @@ func TestCopyTreeFailsAndKeepsTheSource(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(src, "movie.mkv")); err != nil {
 		t.Fatalf("the source is gone: %v", err)
+	}
+}
+
+// The copy is in place and whole, but the source cannot be removed. The
+// move says so apart from a failed copy: the entry IS at the destination.
+func TestMoveSaysWhenTheSourceCannotBeRemoved(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions")
+	}
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+	os.MkdirAll(src, 0o755)
+	os.MkdirAll(dst, 0o755)
+	writeFile(t, filepath.Join(src, "movie.mkv"), "hello")
+	// The source cannot be removed: its directory is read-only.
+	if err := os.Chmod(src, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(src, 0o755)
+
+	// The copy of another volume: the copy goes to a name of its own and is
+	// put in place at the end.
+	err := copyAndPublish(filepath.Join(src, "movie.mkv"), filepath.Join(dst, "movie.mkv"), nil)
+	if err == nil {
+		t.Fatal("want an error when the source cannot be removed")
+	}
+	if !errors.Is(err, ErrSourceNotRemoved) {
+		t.Fatalf("the move returned %v, want %v", err, ErrSourceNotRemoved)
+	}
+	// The copy is in place and whole.
+	body, readErr := os.ReadFile(filepath.Join(dst, "movie.mkv"))
+	if readErr != nil || string(body) != "hello" {
+		t.Fatalf("the file at the destination is %q %v, want the whole file", body, readErr)
 	}
 }
 
@@ -146,5 +240,55 @@ func TestCopyTreeRefusesAnExistingDestination(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dst, "somebody-elses.mkv"))
 	if err != nil || string(body) != "not ours" {
 		t.Fatalf("the file in the destination was touched: %q %v", body, err)
+	}
+}
+
+func TestAtomicRenameNeverReplacesADestination(t *testing.T) {
+	for _, directory := range []bool{false, true} {
+		t.Run(fmt.Sprint(directory), func(t *testing.T) {
+			root := t.TempDir()
+			src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
+			if directory {
+				os.Mkdir(src, 0700)
+				os.Mkdir(dst, 0700)
+			} else {
+				writeFile(t, src, "ours")
+				writeFile(t, dst, "theirs")
+			}
+			if err := renameNoReplace(src, dst); !errors.Is(err, os.ErrExist) {
+				t.Fatalf("got %v, want EEXIST", err)
+			}
+			if _, err := os.Lstat(src); err != nil {
+				t.Fatal("source disappeared", err)
+			}
+			if !directory {
+				data, _ := os.ReadFile(dst)
+				if string(data) != "theirs" {
+					t.Fatal("destination overwritten")
+				}
+			}
+		})
+	}
+}
+
+func TestCopyDoesNotReplaceAFileCreatedDuringCopy(t *testing.T) {
+	root := t.TempDir()
+	src, dst := filepath.Join(root, "src"), filepath.Join(root, "dst")
+	writeFile(t, src, "ours")
+	err := copyAndPublish(src, dst, func(int64) { writeFile(t, dst, "theirs") })
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("got %v, want EEXIST", err)
+	}
+	for path, want := range map[string]string{src: "ours", dst: "theirs"} {
+		data, _ := os.ReadFile(path)
+		if string(data) != want {
+			t.Fatalf("changed %s: %q", path, data)
+		}
+	}
+}
+
+func TestSyncDirectoryReportsErrors(t *testing.T) {
+	if err := syncDir(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing directory was not reported")
 	}
 }

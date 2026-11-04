@@ -20,6 +20,13 @@ type Progress func(copied int64)
 // picked up by the next attempt under a name the daemon owns.
 const PartialSuffix = ".drs-partial"
 
+// ErrSourceNotRemoved means the copy is in place and the source could not
+// be removed.
+//
+// It is not a failed move: the entry is at the destination and is whole.
+// The source is a leftover that takes up space until somebody removes it.
+var ErrSourceNotRemoved = errors.New("the source could not be removed")
+
 // Move moves the entry at src to dst.
 //
 // The same filesystem is a rename; a different one is a copy followed by the
@@ -37,16 +44,22 @@ func Move(src, dst string, progress Progress) error {
 	// it is in the way.
 	os.RemoveAll(dst + PartialSuffix)
 
-	err := os.Rename(src, dst)
+	err := renameNoReplace(src, dst)
 	if err == nil {
 		return nil
 	}
 	if !errors.Is(err, syscall.EXDEV) {
 		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
+	return copyAndPublish(src, dst, progress)
+}
 
-	// The copy goes to a name of its own and is put in place at the end, so
-	// that nothing of somebody else is ever written into or deleted.
+// copyAndPublish copies the entry to another volume and puts it in place.
+//
+// The copy goes to a name of its own and is put in place at the end, so
+// that nothing of somebody else is ever written into or deleted. The source
+// is removed only after the copy is in place.
+func copyAndPublish(src, dst string, progress Progress) error {
 	partial := dst + PartialSuffix
 	if err := CopyTree(src, partial, progress); err != nil {
 		os.RemoveAll(partial)
@@ -57,14 +70,49 @@ func Move(src, dst string, progress Progress) error {
 		os.RemoveAll(partial)
 		return fmt.Errorf("move %q: %w", dst, os.ErrExist)
 	}
-	if err := os.Rename(partial, dst); err != nil {
+	if err := renameNoReplace(partial, dst); err != nil {
 		os.RemoveAll(partial)
 		return fmt.Errorf("move %q to %q: %w", src, dst, err)
 	}
+	// The name must reach the disk too, or a power cut would leave the file
+	// without a name.
+	if err := syncDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(src); err != nil {
-		return fmt.Errorf("remove the source %q: %w", src, err)
+		// The copy is whole and in place. The source is a leftover: it is
+		// said apart from a failed copy, because the move did succeed.
+		return fmt.Errorf("%w: %q: %w", ErrSourceNotRemoved, src, err)
 	}
 	return nil
+}
+
+// Size returns the size of the entry: the size of the file, or the sum of
+// the sizes of the files in the tree.
+func Size(path string) (int64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.IsDir() {
+		size, _, err := treeStat(path)
+		return size, err
+	}
+	return info.Size(), nil
+}
+
+// syncDir persists directory entries before the source can be removed.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sync directory %q: %w", dir, syncErr)
+	}
+	return closeErr
 }
 
 // CopyTree copies src to dst.
@@ -105,7 +153,10 @@ func (c *copier) copy(src, dst string) error {
 	case info.IsDir():
 		// Mkdir, not MkdirAll: a directory that is already there means the
 		// copy would mix our files with somebody else's.
-		if err := os.Mkdir(dst, info.Mode().Perm()); err != nil {
+		//
+		// The mode of the source is set at the end: a directory that is
+		// read-only would not take the files of the copy.
+		if err := os.Mkdir(dst, 0o700); err != nil {
 			return err
 		}
 		items, err := os.ReadDir(src)
@@ -117,8 +168,11 @@ func (c *copier) copy(src, dst string) error {
 				return err
 			}
 		}
+		if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
 		restoreTimes(src, dst)
-		return nil
+		return syncDir(dst)
 
 	case info.Mode().IsRegular():
 		return c.copyFile(src, dst, info)
@@ -137,31 +191,32 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 
 	// O_EXCL: the file must not be there yet, or the copy would overwrite
 	// what is already there.
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(out, &countingReader{reader: in, counter: c})
+	// io.Copy returns how many bytes it copied.
+	written, err := io.Copy(out, in)
+	c.add(written)
+	// The data must reach the disk before the file is closed: the source is
+	// removed after the copy, and a power cut in between must not leave a
+	// file that is there but empty.
+	if syncErr := out.Sync(); err == nil {
+		err = syncErr
+	}
 	if closeErr := out.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		return err
 	}
+	// The mode of the source is set here: the umask would have eaten it
+	// when the file was created.
+	if err := os.Chmod(dst, info.Mode().Perm()); err != nil {
+		return err
+	}
 	restoreTimes(src, dst)
 	return nil
-}
-
-// countingReader counts the bytes that go through it.
-type countingReader struct {
-	reader  io.Reader
-	counter *copier
-}
-
-func (r *countingReader) Read(p []byte) (int, error) {
-	n, err := r.reader.Read(p)
-	r.counter.add(int64(n))
-	return n, err
 }
 
 // restoreTimes copies the modification time of src onto dst.

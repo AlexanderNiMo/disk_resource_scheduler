@@ -9,7 +9,6 @@ import (
 
 	"github.com/alex/disk_resource_scheduler/internal/config"
 	"github.com/alex/disk_resource_scheduler/internal/scheduler"
-	"github.com/go-chi/chi/v5"
 )
 
 // Server is the web interface.
@@ -58,37 +57,37 @@ func New(cfg *config.Store, log *slog.Logger, sch *scheduler.Scheduler, history 
 // a route added later is authenticated by default rather than by whoever
 // remembers to wrap it.
 func (s *Server) Handler() http.Handler {
-	r := chi.NewRouter()
-	r.Use(s.accessLog)
-	r.Use(s.sessions)
+	mux := http.NewServeMux()
 
-	r.Get("/login", s.handleLoginForm)
-	r.Post("/login", s.handleLogin)
-	r.Post("/logout", s.handleLogout)
+	mux.HandleFunc("GET /login", s.handleLoginForm)
+	mux.HandleFunc("POST /login", s.handleLogin)
+	mux.HandleFunc("POST /logout", s.handleLogout)
 
-	r.Group(func(r chi.Router) {
-		r.Use(s.requireAuth)
+	mux.Handle("GET /{$}", s.auth(s.handleDashboard))
+	mux.Handle("GET /fragments/plan", s.auth(s.handlePlanFragment))
 
-		r.Get("/", s.handleDashboard)
-		r.Get("/fragments/plan", s.handlePlanFragment)
+	// The same handlers serve the pages and the API: the answer is
+	// JSON for the API and a page otherwise.
+	mux.Handle("POST /scan", s.auth(s.handleScan))
+	mux.Handle("POST /plan/approve", s.auth(s.handleApprove))
+	mux.Handle("POST /plan/reject", s.auth(s.handleReject))
+	mux.Handle("POST /plan/rollback", s.auth(s.handleRollback))
 
-		// The same handlers serve the pages and the API: the answer is
-		// JSON for the API and a page otherwise.
-		r.Post("/scan", s.handleScan)
-		r.Post("/plan/approve", s.handleApprove)
-		r.Post("/plan/reject", s.handleReject)
-		r.Post("/plan/rollback", s.handleRollback)
+	mux.Handle("GET /api/plan", s.auth(s.apiPlan))
+	mux.Handle("GET /api/history", s.auth(s.apiHistory))
+	mux.Handle("POST /api/scan", s.auth(s.handleScan))
+	mux.Handle("POST /api/plan/approve", s.auth(s.handleApprove))
+	mux.Handle("POST /api/plan/reject", s.auth(s.handleReject))
+	mux.Handle("POST /api/plan/rollback", s.auth(s.handleRollback))
 
-		r.Get("/api/plan", s.apiPlan)
-		r.Get("/api/history", s.apiHistory)
-		r.Post("/api/scan", s.handleScan)
-		r.Post("/api/plan/approve", s.handleApprove)
-		r.Post("/api/plan/reject", s.handleReject)
-		r.Post("/api/plan/rollback", s.handleRollback)
-	})
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.tmpl.static))))
 
-	r.Handle("/static/*", http.StripPrefix("/static/", http.FileServer(http.FS(s.tmpl.static))))
-	return r
+	return s.accessLog(s.sessions(mux))
+}
+
+// auth puts the check for a session in front of a handler.
+func (s *Server) auth(next http.HandlerFunc) http.Handler {
+	return s.requireAuth(next)
 }
 
 // accessLog writes one line per request.

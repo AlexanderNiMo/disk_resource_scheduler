@@ -136,6 +136,23 @@ func (c *copier) add(n int64) {
 	}
 }
 
+// progressReader counts the bytes that go through it.
+//
+// The copy of a file is one long read, and the progress is reported while it
+// runs: the caller wants to know how far it has come, not whether it is done.
+type progressReader struct {
+	reader io.Reader
+	copier *copier
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.reader.Read(b)
+	if n > 0 {
+		p.copier.add(int64(n))
+	}
+	return n, err
+}
+
 func (c *copier) copy(src, dst string) error {
 	info, err := os.Lstat(src)
 	if err != nil {
@@ -195,9 +212,10 @@ func (c *copier) copyFile(src, dst string, info fs.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	// io.Copy returns how many bytes it copied.
-	written, err := io.Copy(out, in)
-	c.add(written)
+	// The copy is read through a reader that counts: the progress has to be
+	// reported while the file is copied, not after it. A big file takes a
+	// while, and the interface shows how far it has come.
+	_, err = io.Copy(out, &progressReader{reader: in, copier: c})
 	// The data must reach the disk before the file is closed: the source is
 	// removed after the copy, and a power cut in between must not leave a
 	// file that is there but empty.

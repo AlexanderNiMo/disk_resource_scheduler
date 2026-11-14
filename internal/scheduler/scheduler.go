@@ -932,6 +932,10 @@ func (s *Scheduler) transfer(plan *Plan, index int, from, to string, okStatus st
 			}
 		}
 		s.setAttempt(plan, index, attempt)
+		// The copy starts from zero: the bytes of the previous attempt are
+		// not part of this one, and the interface would show them as if they
+		// were.
+		s.setProgress(plan, index, 0)
 
 		started := time.Now()
 		var published int64

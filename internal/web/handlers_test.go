@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -184,6 +185,73 @@ func TestTheDashboardShowsTheFolders(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "План перемещения") {
 		t.Fatalf("the dashboard does not show the plan: %s", body)
+	}
+}
+
+// The column of the state shows how far the copy has come: a big file takes
+// a while, and the person who waits for it wants to see it move.
+func TestTheStateColumnShowsTheProgressOfTheCopy(t *testing.T) {
+	stateDir := t.TempDir()
+	plan := &scheduler.Plan{
+		ID:        7,
+		CreatedAt: time.Now(),
+		Moves: []scheduler.Move{{
+			ID:      1,
+			Src:     "/media8/serials",
+			Name:    "movie.mkv",
+			Path:    "/media8/serials/movie.mkv",
+			Dst:     "/media5/serials",
+			DstPath: "/media5/serials/movie.mkv",
+			Size:    1000,
+			Type:    2,
+			Status:  scheduler.StatusMoving,
+			Copied:  400,
+		}},
+	}
+	// The daemon keeps the plan in its state file: a plan that is being
+	// executed comes back from there after a restart.
+	data, err := json.Marshal(map[string]any{"state": "pending", "plan": plan})
+	if err != nil {
+		t.Fatalf("encode the plan: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "state.json"), data, 0o600); err != nil {
+		t.Fatalf("write the state file: %v", err)
+	}
+
+	cfg := &config.Config{
+		Server: config.Server{Listen: "127.0.0.1:0"},
+		Web:    config.Web{Users: map[string]string{"alex": "secret"}},
+		Folders: map[string]config.Folder{
+			"/media8/serials": {Path: "/media8/serials", DirType: config.DirTypeSrc, Type: 2, MinFree: 50 << 30},
+			"/media5/serials": {Path: "/media5/serials", DirType: config.DirTypeDst, Type: 2},
+		},
+	}
+	store := config.NewStore(cfg)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	history := scheduler.NewHistory(t.TempDir())
+	sch := scheduler.New(store, logger, schedulerProbe{}, scheduler.NewStateStore(stateDir), history)
+	if err := sch.Start(context.Background()); err != nil {
+		t.Fatalf("start the scheduler: %v", err)
+	}
+	t.Cleanup(func() { sch.Stop(context.Background()) })
+
+	server, err := New(store, logger, sch, history)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	t.Cleanup(httpServer.Close)
+
+	client := login(t, httpServer)
+	resp, err := client.Get(httpServer.URL + "/fragments/plan")
+	if err != nil {
+		t.Fatalf("get the plan fragment: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "скопировано 400 Б") {
+		t.Fatalf("the plan does not show the progress of the copy: %s", body)
 	}
 }
 

@@ -324,11 +324,11 @@ func TestTheHistoryKeepsTheLastPlans(t *testing.T) {
 	if len(entries) != 50 {
 		t.Fatalf("the history has %d entries, want 50", len(entries))
 	}
-	if entries[len(entries)-1].ID != 59 {
-		t.Fatalf("the last entry is #%d, want #59", entries[len(entries)-1].ID)
+	if entries[0].ID != 59 {
+		t.Fatalf("the first entry is #%d, want #59", entries[0].ID)
 	}
-	if entries[0].ID != 10 {
-		t.Fatalf("the first entry is #%d, want #10", entries[0].ID)
+	if entries[len(entries)-1].ID != 10 {
+		t.Fatalf("the last entry is #%d, want #10", entries[len(entries)-1].ID)
 	}
 
 	body, err := os.ReadFile(filepath.Join(dir, "history.jsonl"))
@@ -337,6 +337,27 @@ func TestTheHistoryKeepsTheLastPlans(t *testing.T) {
 	}
 	if lines := strings.Count(string(body), "\n"); lines != 50 {
 		t.Fatalf("the file has %d lines, want 50", lines)
+	}
+}
+
+func TestTheHistoryIsNewestFirst(t *testing.T) {
+	history := NewHistory(t.TempDir())
+
+	for _, id := range []int{1, 2, 3} {
+		entry := HistoryEntry{ID: id, Kind: "plan", CreatedAt: time.Now(), State: "done"}
+		if err := history.Append(entry); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	entries, err := history.List()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for i, want := range []int{3, 2, 1} {
+		if entries[i].ID != want {
+			t.Fatalf("entry %d is #%d, want #%d", i, entries[i].ID, want)
+		}
 	}
 }
 

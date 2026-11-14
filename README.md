@@ -83,7 +83,7 @@ ssh -L 8088:127.0.0.1:8088 media-server
 
 ```
 GET  /api/plan          состояние, текущий план и история
-GET  /api/history       законченные планы
+GET  /api/history       законченные планы, от новых к старым
 POST /api/scan          сканировать сейчас
 POST /api/plan/approve  plan_id — одобрить план
 POST /api/plan/reject   plan_id — отклонить план

@@ -129,6 +129,37 @@ func TestCopyTreeOfAReadOnlyDirectory(t *testing.T) {
 	}
 }
 
+// The progress must be reported while the copy runs: a big file takes a
+// while, and the interface shows how far the copy has come.
+func TestTheCopyReportsTheProgressWhileItRuns(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+
+	body := make([]byte, 8<<20)
+	writeFile(t, filepath.Join(src, "movie.mkv"), string(body))
+	writeFile(t, filepath.Join(src, "Show.S01", "ep01.mkv"), "abc")
+
+	var reports []int64
+	// The copy between two volumes: the file goes to a name of its own and
+	// is put in place at the end.
+	if err := copyAndPublish(src, dst, func(copied int64) { reports = append(reports, copied) }); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if len(reports) < 2 {
+		t.Fatalf("the copy reported %d times, want more than once: %v", len(reports), reports)
+	}
+	for i := 1; i < len(reports); i++ {
+		if reports[i] <= reports[i-1] {
+			t.Fatalf("the progress did not move forward: %v", reports)
+		}
+	}
+	want := int64(len(body)) + 3
+	if last := reports[len(reports)-1]; last != want {
+		t.Fatalf("the last report is %d, want %d", last, want)
+	}
+}
+
 func TestCopyTreeFailsAndKeepsTheSource(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root writes into a read-only directory")

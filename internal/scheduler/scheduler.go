@@ -652,15 +652,18 @@ func (s *Scheduler) Rollback(planID, moveID int) error {
 }
 
 // planFromHistory looks a plan up in the history.
+//
+// The history is newest first, so the first match is the newest one: a plan
+// that was already put back is found in its rolled back state.
 func (s *Scheduler) planFromHistory(planID int) *Plan {
 	entries, err := s.history.List()
 	if err != nil {
 		s.log.Warn("could not read the history", "error", err)
 		return nil
 	}
-	for i := len(entries) - 1; i >= 0; i-- {
-		if entries[i].ID == planID && entries[i].Plan != nil {
-			return entries[i].Plan
+	for _, entry := range entries {
+		if entry.ID == planID && entry.Plan != nil {
+			return entry.Plan
 		}
 	}
 	return nil

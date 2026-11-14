@@ -64,7 +64,10 @@ func (h *History) Append(entry HistoryEntry) error {
 	return h.prune()
 }
 
-// List returns the plans in the history, oldest first.
+// List returns the plans in the history, newest first.
+//
+// The newest plan is the one the user is looking for, so it comes first.
+// The file itself stays in the order it was written in.
 func (h *History) List() ([]HistoryEntry, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -74,9 +77,9 @@ func (h *History) List() ([]HistoryEntry, error) {
 		return nil, err
 	}
 	entries := make([]HistoryEntry, 0, len(lines))
-	for _, line := range lines {
+	for i := len(lines) - 1; i >= 0; i-- {
 		var entry HistoryEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
+		if err := json.Unmarshal(lines[i], &entry); err != nil {
 			// A line that cannot be read is skipped: the rest of the
 			// history is still worth having.
 			continue
